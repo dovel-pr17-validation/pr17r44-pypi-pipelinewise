@@ -27,7 +27,7 @@ setup(name='pipelinewise',
           'joblib==1.3.2',
           'PyMySQL==1.1.3',
           'psycopg2-binary==2.9.10',
-          'alembic==1.18.5',
+          'alembic==1.20.1',
           'croniter==6.2.4',
           'SQLAlchemy==2.0.51',     # Alembic's engine; pinned rather than implicit
           'snowflake-connector-python==4.7.3',
