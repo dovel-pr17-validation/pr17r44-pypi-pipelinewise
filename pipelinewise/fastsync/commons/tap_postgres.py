@@ -1,0 +1,849 @@
+import datetime
+import decimal
+import glob
+import logging
+import math
+import os
+import re
+import sys
+import psycopg2
+from singer.logger import log_source_host
+import psycopg2.extras
+
+from argparse import Namespace
+from typing import Callable, Dict, Optional
+
+
+from . import utils, split_gzip
+from .partial_sync_boundary import PartialSyncBoundary
+from .source_transformations import compile_source_select, quote_source_identifier, validate_bookmark_column
+from .source_numeric import decimal_text_expression, require_exact_decimal_boundary, warn_decimal_mapping
+from singer.decimal_support import postgres_numeric_scale
+from ...utils import safe_column_name
+
+LOGGER = logging.getLogger(__name__)
+MIN_SUPPORTED_POSTGRES_VERSION = 140000
+
+
+class UnsupportedPostgresVersionError(RuntimeError):
+    """The source server is older than the supported PostgreSQL version floor."""
+
+
+class FastSyncTapPostgres:
+    """
+    Common functions for fastsync from a Postgres database
+    """
+
+    def __init__(self, connection_config, tap_type_to_target_type, target_quote=None):
+        self.connection_config = connection_config
+        self.tap_type_to_target_type = tap_type_to_target_type
+        self.target_quote = target_quote
+        self.source_transformations = None
+        self.target_iceberg_version = None
+        self.hstore_as_json = False
+        self.target_type = None
+        self.conn = None
+        self.curr = None
+        self.primary_host_conn = None
+
+    @staticmethod
+    def generate_replication_slot_name(dbname, tap_id=None, prefix='pipelinewise'):
+        """Generate replication slot name with
+
+        :param str dbname: Database name that will be part of the replication slot name
+        :param str tap_id: Optional. If provided then it will be appended to the end of the slot name
+        :param str prefix: Optional. Defaults to 'pipelinewise'
+        :return: well formatted lowercased replication slot name
+        :rtype: str
+        """
+        # Add tap_id to the end of the slot name if provided
+        if tap_id:
+            tap_id = f'_{tap_id}'
+        # Convert None to empty string
+        else:
+            tap_id = ''
+
+        slot_name = f'{prefix}_{dbname}{tap_id}'.lower()
+
+        # Replace invalid characters to ensure replication slot name is in accordance with Postgres spec
+        return re.sub('[^a-z0-9_]', '_', slot_name)
+
+    @classmethod
+    def __get_slot_name(
+        cls,
+        connection,
+        dbname: str,
+        tap_id: str,
+    ) -> str:
+        """
+        Finds the right slot name to use and returns it
+
+        Args:
+            connection: pg connection instance
+            dbname: db name
+            tap_id: Id of tha tap
+
+        Returns:
+            String: slot name
+
+        """
+        # Replication hosts pattern versions
+        slot_name_v15 = cls.generate_replication_slot_name(dbname)
+        slot_name_v16 = cls.generate_replication_slot_name(dbname, tap_id)
+
+        v15_slots_count = 0
+
+        try:
+            # Backward compatibility: try to locate existing v15 slot first. PPW <= 0.15.0
+            with connection.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+                cur.execute(
+                    f"SELECT * FROM pg_replication_slots WHERE slot_name = '{slot_name_v15}';"
+                )
+                v15_slots_count = cur.rowcount
+
+        except psycopg2.Error:
+            LOGGER.exception('Error while looking for slots', exc_info=sys.exc_info())
+        finally:
+            if v15_slots_count > 0:
+                slot_name = slot_name_v15
+            else:
+                slot_name = slot_name_v16
+
+        return slot_name
+
+    @classmethod
+    def drop_slot(
+        cls,
+        connection_config: Dict,
+        *,
+        allow_unsupported_version_for_config_removal: bool = False,
+    ) -> None:
+        """
+        Dropping the logical replication slot from primary server
+
+        Args:
+            connection_config: Dictionary with db credentials
+            allow_unsupported_version_for_config_removal: Permit cleanup of a
+                removed tap whose source predates the supported version floor.
+        """
+        LOGGER.info('Attempting to drop slot ...')
+
+        LOGGER.debug('Creating a connection to Primary server ..')
+        connection = cls.get_connection(
+            connection_config,
+            prioritize_primary=True,
+            allow_unsupported_version_for_config_removal=(
+                allow_unsupported_version_for_config_removal
+            ),
+        )
+        LOGGER.debug('Connection to Primary server created.')
+
+        try:
+            slot_name = cls.__get_slot_name(
+                connection, connection_config['dbname'], connection_config['tap_id']
+            )
+
+            LOGGER.info('Dropping the slot "%s"', slot_name)
+            # drop the replication host
+            with connection.cursor() as cur:
+                cur.execute(
+                    f'SELECT pg_drop_replication_slot(slot_name) '
+                    f"FROM pg_replication_slots WHERE slot_name = '{slot_name}';"
+                )
+                LOGGER.info('Number of dropped slots: %s', cur.rowcount)
+
+        finally:
+            connection.close()
+
+    @classmethod
+    def reset_slot(cls, connection_config: Dict, *, before_reset: Callable[[], Optional[str]]) -> None:
+        """Validate one tap-specific slot, invalidate state, then replace the slot."""
+        LOGGER.info('Attempting to reset slot ...')
+
+        connection = cls.get_connection(connection_config, prioritize_primary=True)
+        try:
+            with connection.cursor() as cur:
+                slot_name, slot_exists = cls._preflight_slot_reset(cur, connection_config)
+                # State must be durable before DROP: losing its response cannot restore the old WAL boundary.
+                backup_path = before_reset()
+                phase = 'drop' if slot_exists else 'create'
+                try:
+                    if slot_exists:
+                        LOGGER.info('Dropping the slot "%s"', slot_name)
+                        cur.execute('SELECT pg_drop_replication_slot(%s)', (slot_name,))
+                    phase = 'create'
+                    LOGGER.info('Creating the slot "%s"', slot_name)
+                    cur.execute(
+                        'SELECT * FROM pg_create_logical_replication_slot(%s, %s)',
+                        (slot_name, 'wal2json'),
+                    )
+                except psycopg2.Error as exc:
+                    raise RuntimeError(
+                        f'PostgreSQL slot reset failed during {phase} for "{slot_name}"; '
+                        'the source-side outcome may be uncertain. Tap bookmarks remain invalidated. '
+                        f'Pre-reset state backup: {backup_path or "no previous state file"}. '
+                        'Keep scheduled replication stopped, resolve the source error, and rerun '
+                        'the unfiltered fast_sync (adding --force only to bypass the size limit). '
+                        'Do not restore old LOG_BASED bookmarks '
+                        'after a completed or uncertain slot drop.'
+                    ) from exc
+        finally:
+            connection.close()
+
+    @classmethod
+    def _preflight_slot_reset(cls, cursor, connection_config):
+        """Reject shared, active, or incompatible slots before invalidating state."""
+        database = connection_config['dbname']
+        legacy_name = cls.generate_replication_slot_name(database)
+        slot_name = cls.generate_replication_slot_name(database, connection_config['tap_id'])
+        if slot_name == legacy_name or len(slot_name) > 63:
+            raise RuntimeError('Slot reset requires a distinct tap-specific slot name of at most 63 characters.')
+        cursor.execute(
+            'SELECT slot_name, database, plugin, active FROM pg_replication_slots '
+            'WHERE slot_name IN (%s, %s)',
+            (legacy_name, slot_name),
+        )
+        slots = {row[0]: row[1:] for row in cursor.fetchall()}
+        if legacy_name in slots:
+            raise RuntimeError(
+                f'Cannot reset legacy PostgreSQL slot "{legacy_name}": it may be shared by other taps. '
+                'Coordinate migration to tap-specific slots with your DBA before retrying. '
+                'No source or state changes were made.'
+            )
+        if slot_name in slots:
+            slot_database, plugin, active = slots[slot_name]
+            if active or slot_database != database or plugin != 'wal2json':
+                raise RuntimeError(
+                    f'Cannot reset PostgreSQL slot "{slot_name}": it must be inactive, use wal2json, '
+                    'and belong to the configured database. No source or state changes were made.'
+                )
+        return slot_name, slot_name in slots
+
+    @classmethod
+    def get_connection(
+        cls,
+        connection_config: Dict,
+        prioritize_primary: bool = False,
+        *,
+        allow_unsupported_version_for_config_removal: bool = False,
+    ):
+        """
+        Class method to create a pg connection instance with autocommit enabled
+        Connection is either to the primary or a replica if its credentials are given
+
+        Args:
+            prioritize_primary: boolean to control whether to connect to primary or replica
+            connection_config: Dictionary containing the db connection details
+            allow_unsupported_version_for_config_removal: Permit only removed-tap
+                cleanup to connect below the supported version floor.
+        Returns:
+            pg Connection instance
+        """
+        template = "host='{}' port='{}' user='{}' password='{}' dbname='{}'"
+
+        if prioritize_primary:
+            log_source_host(LOGGER, 'PostgreSQL', connection_config['host'])
+            conn_string = template.format(
+                connection_config['host'],
+                connection_config['port'],
+                connection_config['user'],
+                connection_config['password'],
+                connection_config['dbname'],
+            )
+        else:
+            log_source_host(LOGGER, 'PostgreSQL', connection_config.get('replica_host', connection_config['host']))
+            conn_string = template.format(
+                # Fastsync is using replica_{host|port|user|password} values from the config by default
+                # to avoid making heavy load on the primary source database when syncing large tables
+                #
+                # If replica_{host|port|user|password} values are not defined in the config then it's
+                # using the normal credentials to connect
+                connection_config.get('replica_host', connection_config['host']),
+                connection_config.get('replica_port', connection_config['port']),
+                connection_config.get('replica_user', connection_config['user']),
+                connection_config.get(
+                    'replica_password', connection_config['password']
+                ),
+                connection_config['dbname'],
+            )
+
+        if 'ssl' in connection_config and connection_config['ssl'] == 'true':
+            conn_string += " sslmode='require'"
+
+        conn = psycopg2.connect(conn_string)
+
+        if (
+            not allow_unsupported_version_for_config_removal
+            and conn.server_version < MIN_SUPPORTED_POSTGRES_VERSION
+        ):
+            server_version = conn.server_version
+            try:
+                conn.close()
+            finally:
+                raise UnsupportedPostgresVersionError(
+                    'PostgreSQL 14 or later is required; '
+                    f'connected server reports server_version_num {server_version}'
+                )
+
+        # Set connection to autocommit
+        conn.autocommit = True
+
+        LOGGER.info('Connection to PGSQL server established')
+
+        return conn
+
+    def open_connection(self):
+        """
+        Open connection
+        """
+        self.conn = self.get_connection(
+            self.connection_config, prioritize_primary=False
+        )
+        self.curr = self.conn.cursor()
+
+    def close_connection(self, silent=False):
+        """
+        Close source connections
+        """
+        connection = self.conn
+        self.conn = None
+        self.curr = None
+
+        self._close_primary_host_connection(silent=silent)
+
+        if connection is None:
+            return
+
+        try:
+            connection.close()
+        except Exception as exc:
+            if not silent:
+                LOGGER.exception(exc)
+                LOGGER.info('Connection seems to be already closed.')
+
+    def _close_primary_host_connection(self, silent=False):
+        """Close and clear the dedicated primary-host connection."""
+        connection = self.primary_host_conn
+        self.primary_host_conn = None
+
+        if connection is None:
+            return
+
+        try:
+            connection.close()
+        except Exception as exc:
+            if not silent:
+                LOGGER.exception(exc)
+                LOGGER.info('Primary host connection seems to be already closed.')
+
+    def query(self, query, params=None):
+        """
+        Run query
+        """
+        LOGGER.info('Running query: %s', query)
+        with self.conn as connection:
+            with connection.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+                cur.execute(query, params)
+
+                if cur.rowcount > 0:
+                    return cur.fetchall()
+
+                return []
+
+    def primary_host_query(self, query, params=None):
+        """
+        Run query on the primary host
+        """
+        LOGGER.info('Running query: %s', query)
+        with self.primary_host_conn as connection:
+            with connection.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+                cur.execute(query, params)
+
+                if cur.rowcount > 0:
+                    return cur.fetchall()
+
+                return []
+
+    def create_replication_slot(self):
+        """
+        Create replication slot on the primary host
+
+        IMPORTANT:
+        Replication slot name is different after PPW >=0.16.0 and it's using a
+        new pattern: pipelinewise_<dbname>_<tap_id>         PPW >= 0.16.0
+        old pattern: pipelinewise_<dbname>                  PPW <= 0.15.x
+
+        For backward compatibility and to keep the existing replication slots usable
+        we check if there's any existing replication slot with the old format.
+        If exists we keep using the old one but please note that using the old
+        format you won't be able to do LOG_BASED replication from the same postgres
+        database by multiple taps. If that the case then you need to drop the old
+        replication slot and full-resync the new taps.
+        """
+        try:
+            slot_name = self.__get_slot_name(
+                self.primary_host_conn,
+                self.connection_config['dbname'],
+                self.connection_config['tap_id'],
+            )
+
+            # Create the replication host
+            self.primary_host_query(
+                f"SELECT * FROM pg_create_logical_replication_slot('{slot_name}', 'wal2json')"
+            )
+        except Exception as exc:
+            # ERROR: replication slot already exists SQL state: 42710
+            if hasattr(exc, 'pgcode') and exc.pgcode == '42710':
+                pass
+            else:
+                raise exc
+
+    def fetch_current_log_pos(self):
+        """
+        Get the actual wal position in Postgres
+        """
+        # Create replication slot dedicated connection
+        # Always use Primary server for creating replication_slot
+        self.primary_host_conn = self.get_connection(
+            self.connection_config, prioritize_primary=True
+        )
+        try:
+            # Create replication slot
+            self.create_replication_slot()
+        finally:
+            self._close_primary_host_connection()
+
+        # is replica_host set ?
+        if self.connection_config.get('replica_host'):
+            # Get latest applied lsn from replica_host
+            result = self.query('SELECT pg_last_wal_replay_lsn() AS current_lsn')
+        else:
+            # Get current lsn from primary host
+            result = self.query('SELECT pg_current_wal_lsn() AS current_lsn')
+
+        current_lsn = result[0].get('current_lsn')
+        file, index = current_lsn.split('/')
+        lsn = (int(file, 16) << 32) + int(index, 16)
+
+        return {'lsn': lsn, 'version': 1}
+
+    def fetch_current_incremental_key_pos(self, table, replication_key):
+        """
+        Get the actual incremental key position in the table
+        """
+        validate_bookmark_column(table, replication_key, self.source_transformations)
+        schema_name, table_name = table.split('.')
+        result = self.query(
+            f'SELECT MAX({replication_key}) AS key_value FROM {schema_name}."{table_name}"'
+        )
+        if not result:
+            raise Exception(
+                f'Cannot get replication key value for table: {table}'
+            )
+
+        postgres_key_value = result[0].get('key_value')
+
+        if isinstance(postgres_key_value, float) and not math.isfinite(postgres_key_value):
+            # Tap state loaders reject NaN/Infinity JSON; NaN sorts above Infinity, so this range yields the
+            # finite maximum and Singer re-reads nonfinite keys above it.
+            column = quote_source_identifier(replication_key, 'postgres')
+            source_table = '.'.join(quote_source_identifier(part, 'postgres') for part in (schema_name, table_name))
+            postgres_key_value = self.query(
+                f'SELECT MAX({column}) AS key_value FROM {source_table} '
+                f"WHERE {column} > '-Infinity' AND {column} < 'Infinity'"
+            )[0].get('key_value')
+
+        if postgres_key_value is None:
+            LOGGER.warning('No replication value found for table %s, returning empty bookmark', table)
+            return {}
+
+        key_value = postgres_key_value
+
+        # Convert postgres data/datetime format to JSON friendly values
+        if isinstance(postgres_key_value, datetime.datetime):
+            key_value = postgres_key_value.isoformat()
+
+        elif isinstance(postgres_key_value, datetime.date):
+            key_value = postgres_key_value.isoformat() + 'T00:00:00'
+
+        elif isinstance(postgres_key_value, decimal.Decimal):
+            key_value = str(postgres_key_value)
+
+        return {
+            'replication_key': replication_key,
+            'replication_key_value': key_value,
+            'version': 1,
+        }
+
+    def get_primary_keys(self, table):
+        """
+        Get the primary key of a table
+        """
+        schema_name, table_name = table.split('.')
+
+        sql = """
+            SELECT attribute.attname
+            FROM pg_catalog.pg_index AS index_def
+            JOIN pg_catalog.pg_class AS table_class
+              ON table_class.oid = index_def.indrelid
+            JOIN pg_catalog.pg_namespace AS namespace
+              ON namespace.oid = table_class.relnamespace
+            CROSS JOIN LATERAL unnest(index_def.indkey)
+              WITH ORDINALITY AS key_column(attnum, key_ordinality)
+            JOIN pg_catalog.pg_attribute AS attribute
+              ON attribute.attrelid = table_class.oid
+             AND attribute.attnum = key_column.attnum
+            WHERE namespace.nspname = %s
+              AND table_class.relname = %s
+              AND index_def.indisprimary
+            ORDER BY key_column.key_ordinality
+        """
+        pk_specs = self.query(sql, (schema_name, table_name))
+        if len(pk_specs) > 0:
+            return [safe_column_name(k[0], self.target_quote) for k in pk_specs]
+
+        return None
+
+    def get_table_columns(self, table_name, max_num=None, date_type='date', *, metadata_query=None):
+        """
+        Get PG table column details from information_schema
+        """
+        table_dict = utils.tablename_to_dict(table_name)
+
+        if max_num:
+            decimals = len(max_num.split('.')[1]) if '.' in max_num else 0
+
+            decimal_format = f"""
+              'CASE WHEN "' || column_name || '" IS NULL THEN NULL ELSE GREATEST(LEAST({max_num}, ROUND("' || column_name || '"::numeric , {decimals})), -{max_num}) END'
+            """  # noqa: E501
+            integer_format = """
+              '"' || column_name || '"'
+            """
+        else:
+            decimal_format = """
+              '"' || column_name || '"'
+            """
+            integer_format = decimal_format
+
+        schema_name = table_dict.get('schema_name')
+        table_name = table_dict.get('table_name')
+        hstore_projection = (
+            "WHEN udt_name = 'hstore' THEN 'hstore_to_json(\"' || "
+            "column_name || '\") AS \"' || column_name || '\"'"
+            if self.hstore_as_json else ''
+        )
+
+        sql = f"""
+                SELECT
+                    column_name
+                    ,CASE WHEN udt_name = 'hstore' THEN 'hstore' ELSE data_type END AS data_type
+                    ,safe_sql_value
+                    ,character_maximum_length
+                    ,numeric_precision
+                    ,numeric_scale
+                FROM (SELECT
+                column_name,
+                data_type,
+                udt_name,
+                CASE
+                    WHEN data_type = 'ARRAY' THEN 'array_to_json("' || column_name || '") AS ' || column_name
+                    {hstore_projection}
+                    WHEN data_type = 'date' THEN
+                       'CASE WHEN "' ||column_name|| E'" < \\'0001-01-01\\' '
+                            'OR "' ||column_name|| E'" > \\'9999-12-31\\' THEN \\'9999-12-31\\' '
+                            'ELSE "' ||column_name|| '"::{date_type} END AS "' ||column_name|| '"'
+                    WHEN udt_name = 'time' THEN 'replace("' || column_name || E'"::varchar,\\\'24:00:00\\\',\\\'00:00:00\\\') AS ' || column_name
+                    WHEN udt_name = 'timetz' THEN 'replace(("' || column_name || E'" at time zone \'\'UTC\'\')::time::varchar,\\\'24:00:00\\\',\\\'00:00:00\\\') AS ' || column_name
+                    WHEN udt_name in ('timestamp', 'timestamptz') THEN
+                       'CASE WHEN "' ||column_name|| E'" < \\'0001-01-01 00:00:00.000\\' '
+                            'OR "' ||column_name|| E'" > \\'9999-12-31 23:59:59.999\\' THEN \\'9999-12-31 23:59:59.999\\' '
+                            'ELSE "' ||column_name|| '" END AS "' ||column_name|| '"'
+                    WHEN data_type IN ('double precision', 'numeric', 'decimal', 'real') THEN {decimal_format} || ' AS ' || column_name
+                    WHEN data_type IN ('smallint', 'integer', 'bigint', 'serial', 'bigserial') THEN {integer_format} || ' AS ' || column_name
+                    ELSE '"'||column_name||'"'
+                END AS safe_sql_value,
+                character_maximum_length,
+                numeric_precision,
+                numeric_scale
+                FROM information_schema.columns
+                WHERE table_schema = %s
+                    AND table_name = %s
+                ORDER BY ordinal_position
+                ) AS x
+            """  # noqa: E501
+
+        query = self.query if metadata_query is None else metadata_query
+        return query(sql, params=(schema_name, table_name))
+
+    def map_table_columns(self, columns, primary_keys=()):
+        """Map already-read metadata without connections or primary-key queries."""
+        primary_keys = {str(name).strip('"`').upper() for name in (primary_keys or ())}
+        mapped = []
+        for column in columns:
+            name = safe_column_name(column[0], self.target_quote)
+            target_type = self._mapped_column_type(column[1], column[3], *column[4:6],
+                                                   is_key=column[0].upper() in primary_keys)
+            if column[1] in ('numeric', 'decimal'):
+                precision, scale = column[4:6]
+                scale = postgres_numeric_scale(scale)
+                declaration = 'NUMERIC' if precision is None else f'NUMERIC({precision},{scale})'
+                warn_decimal_mapping(name, declaration, target_type)
+            mapped.append(f'{name} {target_type}')
+        return mapped
+
+    def _decimal_key_projection(self, table_name, columns):
+        candidates = {column['column_name'] for column in columns
+                      if column.get('data_type') in ('numeric', 'decimal') and self._mapped_column_type(
+                          column['data_type'], None, column.get('numeric_precision'), column.get('numeric_scale'),
+                          is_key=True,
+                      ) == 'VARCHAR(134217728)'}
+        if not candidates:
+            return columns, ()
+        primary_keys = self.get_primary_keys(table_name) or ()
+        projected = []
+        for column in columns:
+            name = column['column_name']
+            if name in candidates and safe_column_name(name, self.target_quote) in primary_keys:
+                identifier = quote_source_identifier(name, 'postgres')
+                expression = decimal_text_expression(identifier, 'postgres')
+                column = dict(column, safe_sql_value=f'{expression} AS {identifier}')
+            projected.append(column)
+        return projected, primary_keys
+
+    def map_column_types_to_target(self, table_name):
+        """
+        Map PG column types to equivalent types in target
+        """
+        postgres_columns = self.get_table_columns(table_name)
+        primary_keys = self.get_primary_keys(table_name)
+        mapped = {
+            'columns': self.map_table_columns(postgres_columns, primary_keys),
+            'primary_key': primary_keys,
+            'source_column_names': [column[0] for column in postgres_columns],
+        }
+        decimal_columns = [
+            column[0].upper() for column in postgres_columns
+            if column[1] in ('numeric', 'decimal')
+        ]
+        if decimal_columns:
+            mapped['decimal_columns'] = decimal_columns
+        return mapped
+
+    def validate_partial_boundary(self, table_name, column_name):
+        """Check the source declaration when a range maps to FLOAT or text."""
+        for column in self.get_table_columns(table_name):
+            if column[0] == column_name:
+                require_exact_decimal_boundary(column_name, column[1])
+                return
+
+    def copy_table(
+        self,
+        table_name,
+        path,
+        max_num=None,
+        date_type='date',
+        split_large_files=False,
+        split_file_chunk_size_mb=1000,
+        split_file_max_chunks=20,
+        compress=True,
+        boundary=None,
+        decimal_float_columns=(),
+    ):
+        """
+        Export data from table to a zipped csv
+        Args:
+            table_name: Fully qualified table name to export
+            path: Path where to create the zip file(s) with the exported data
+            split_large_files: Split large files to multiple pieces and create multiple zip files
+                               with -partXYZ postfix in the filename. (Default: False)
+            split_file_chunk_size_mb: File chunk sizes if `split_large_files` enabled. (Default: 1000)
+            split_file_max_chunks: Max number of chunks if `split_large_files` enabled. (Default: 20)
+        """
+        table_columns = self.get_table_columns(table_name, max_num, date_type)
+        table_columns, _ = self._decimal_key_projection(table_name, table_columns)
+        column_safe_sql_values = [c.get('safe_sql_value') for c in table_columns]
+
+        # If self.get_table_columns returns zero row then table not exist
+        if len(column_safe_sql_values) == 0:
+            raise Exception(f'{table_name} table not found.')
+
+        source_boundary = (
+            boundary.source_sql(
+                'postgres',
+                [column.get('column_name') or column[0] for column in table_columns],
+            )
+            if boundary is not None
+            else None
+        )
+
+        source_table = table_name
+        schema_name, table_name = table_name.split('.')
+
+        metadata_columns = [
+            "now() AT TIME ZONE 'UTC' AS _SDC_EXTRACTED_AT",
+            "now() AT TIME ZONE 'UTC' AS _SDC_BATCHED_AT",
+            'null _SDC_DELETED_AT'
+        ]
+        column_safe_sql_values += metadata_columns
+
+        if source_boundary is not None:
+            where_clause = self.curr.mogrify(
+                source_boundary.statement,
+                source_boundary.parameters,
+            )
+            if isinstance(where_clause, bytes):
+                connection_encoding = self.curr.connection.encoding
+                python_encoding = psycopg2.extensions.encodings.get(
+                    connection_encoding, connection_encoding
+                )
+                where_clause = where_clause.decode(python_encoding)
+        else:
+            where_clause = ''
+
+        select_sql = f'SELECT {",".join(column_safe_sql_values)} FROM {schema_name}."{table_name}"{where_clause}'
+        transformed = self._compile_source_projection(
+            source_table,
+            table_columns,
+            where_clause,
+            decimal_float_columns=decimal_float_columns,
+        )
+        if transformed is not None:
+            select_sql = f'SELECT _ppw_export.*, {",".join(metadata_columns)} FROM ({transformed}) AS _ppw_export'
+        select_sql = self._snowflake_numeric_export(
+            source_table,
+            table_columns,
+            where_clause,
+            select_sql,
+            decimal_float_columns=decimal_float_columns,
+        )
+        sql = f"COPY ({select_sql}) TO STDOUT with CSV DELIMITER ','"
+
+        LOGGER.info('Exporting data: %s', sql)
+
+        gzip_splitter = split_gzip.open(
+            path,
+            mode='wb',
+            chunk_size_mb=split_file_chunk_size_mb,
+            max_chunks=split_file_max_chunks if split_large_files else 0,
+            compress=compress,
+        )
+
+        with gzip_splitter as split_gzip_files:
+            self.curr.copy_expert(sql, split_gzip_files, size=131072)
+
+    def _snowflake_numeric_export(
+        self, table_name, columns, where_clause, select_sql, decimal_float_columns=(),
+    ):
+        """Normalize ordinary NaN only after source transformations have evaluated."""
+        if self.target_type != 'snowflake':
+            return select_sql
+        decimal_float_columns = {str(name).upper() for name in decimal_float_columns}
+        candidates = [column for column in columns if column.get('data_type') in ('numeric', 'decimal') and
+                      column['column_name'].upper() not in decimal_float_columns and
+                      self._mapped_column_type(
+                          column['data_type'], None, column.get('numeric_precision'), column.get('numeric_scale'),
+                      ).startswith('NUMERIC(')]
+        if not candidates:
+            return select_sql
+        primary_keys = self.get_primary_keys(table_name) or ()
+        numeric_names = {
+            column['column_name'] for column in candidates
+            if self._mapped_column_type(
+                column['data_type'], None, column.get('numeric_precision'), column.get('numeric_scale'),
+                is_key=safe_column_name(column['column_name'], self.target_quote) in primary_keys,
+            ).startswith('NUMERIC(')
+        }
+        if not numeric_names:
+            return select_sql
+        numeric_keys = {name for name in numeric_names if safe_column_name(name, self.target_quote) in primary_keys}
+        self._require_finite_snowflake_numeric_keys(table_name, numeric_keys, where_clause)
+        nullable_names = numeric_names - numeric_keys
+        if not nullable_names:
+            return select_sql
+        names = [column['column_name'] for column in columns]
+        names += ['_sdc_extracted_at', '_sdc_batched_at', '_sdc_deleted_at']
+        quoted_names = [quote_source_identifier(name, 'postgres') for name in names]
+        projection = [f"NULLIF({quoted}, 'NaN'::numeric) AS {quoted}" if name in nullable_names else quoted
+                      for name, quoted in zip(names, quoted_names)]
+        return (f'SELECT {", ".join(projection)} FROM ({select_sql}) '
+                f'AS _ppw_numeric_export({", ".join(quoted_names)})')
+
+    def _require_finite_snowflake_numeric_keys(self, table_name, numeric_keys, where_clause):
+        if not numeric_keys:
+            return
+        table_reference = '.'.join(quote_source_identifier(part, 'postgres') for part in table_name.split('.'))
+        checks = ' OR '.join(f"{quote_source_identifier(name, 'postgres')} = 'NaN'::numeric"
+                             for name in sorted(numeric_keys))
+        predicate = f'{where_clause} AND ({checks})' if where_clause else f' WHERE {checks}'
+        rows = self.query(f'SELECT EXISTS (SELECT 1 FROM {table_reference}{predicate}) AS has_nan_keys')
+        if rows[0]['has_nan_keys']:
+            raise ValueError(
+                f'Cannot export NaN in Snowflake NUMERIC primary-key columns {", ".join(sorted(numeric_keys))}; '
+                'numeric key identity must be preserved'
+            )
+
+    def _mapped_column_type(self, data_type, character_maximum_length, numeric_precision=None, numeric_scale=None,
+                            is_key=False):
+        """Share the existing target mapping between DDL and transformation validation."""
+        if data_type in ('numeric', 'decimal'):
+            kwargs = {'is_key': True} if is_key else {}
+            return self.tap_type_to_target_type(
+                data_type, character_maximum_length, numeric_precision, postgres_numeric_scale(numeric_scale), **kwargs,
+            )
+        column_type = (
+            'VARIANT' if data_type == 'hstore' and self.hstore_as_json else self.tap_type_to_target_type(data_type)
+        )
+        if isinstance(column_type, list):
+            column_type = column_type[1 if character_maximum_length > 1 else 0]
+        return column_type
+
+    def _compile_source_projection(
+        self, table_name, table_columns, where_clause='', decimal_float_columns=(),
+    ):
+        """Share projection validation between recovery preflight and export."""
+        if self.source_transformations is None:
+            return None
+        decimal_float_columns = {str(name).upper() for name in decimal_float_columns}
+        table_columns, primary_keys = self._decimal_key_projection(table_name, table_columns)
+        columns = []
+        for column in table_columns:
+            if column['column_name'].upper() in decimal_float_columns:
+                target_type = 'FLOAT'
+            else:
+                target_type = self._mapped_column_type(
+                    column['data_type'], column.get('character_maximum_length'),
+                    column.get('numeric_precision'), column.get('numeric_scale'),
+                    is_key=safe_column_name(column['column_name'], self.target_quote) in primary_keys,
+                )
+            columns.append(dict(column, target_type=target_type))
+        table_reference = '.'.join(
+            quote_source_identifier(part, 'postgres') for part in table_name.split('.')
+        )
+        return compile_source_select(
+            table_name, table_reference, where_clause, columns,
+            self.source_transformations, 'postgres', self.target_iceberg_version,
+        )
+
+    def validate_source_transformations(self, table_name):
+        """Reject invalid rules before binding a new Iceberg recovery attempt."""
+        if self.source_transformations is not None:
+            self._compile_source_projection(table_name, self.get_table_columns(table_name))
+
+    def export_source_table_data(
+            self, args: Namespace, tap_id: str,
+            boundary: PartialSyncBoundary = None, decimal_float_columns=()) -> list:
+        """Exporting data from the source table"""
+        filename = utils.gen_export_filename(tap_id=tap_id, table=args.table, sync_type='partialsync')
+        filepath = os.path.join(args.temp_dir, filename)
+
+        copy_options = {
+            'split_large_files': args.target.get('split_large_files'),
+            'split_file_chunk_size_mb': args.target.get('split_file_chunk_size_mb'),
+            'split_file_max_chunks': args.target.get('split_file_max_chunks'),
+            'boundary': boundary,
+        }
+        if decimal_float_columns:
+            copy_options['decimal_float_columns'] = decimal_float_columns
+        self.copy_table(args.table, filepath, **copy_options)
+        file_parts = glob.glob(f'{filepath}*')
+        return file_parts

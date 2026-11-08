@@ -1,0 +1,118 @@
+---
+
+# ------------------------------------------------------------------------------
+# General Properties
+# ------------------------------------------------------------------------------
+id: "postgres_sample"                  # Unique identifier of the tap
+name: "Sample Postgres Database"       # Name of the tap
+type: "tap-postgres"                   # !! THIS SHOULD NOT CHANGE !!
+owner: "somebody@foo.com"              # Data owner to contact
+#send_alert: False                     # Optional: Disable all configured alerts on this tap
+
+
+# ------------------------------------------------------------------------------
+# Source (Tap) - PostgreSQL connection details
+# ------------------------------------------------------------------------------
+db_conn:
+  host: "<HOST>"                       # PostgreSQL host
+  port: 5432                           # PostgreSQL port
+  user: "<USER>"                       # PostfreSQL user
+  password: "<PASSWORD>"               # Plain string or vault encrypted
+  dbname: "<DB_NAME>"                  # PostgreSQL database name
+  #filter_schemas: "schema1,schema2"   # Optional: Scan only the required schemas
+                                       #           to improve the performance of
+                                       #           data extraction
+  #max_run_seconds                     # Optional: Stop running the tap after certain
+                                       #           number of seconds
+                                       #           Default: 43200
+  #logical_poll_total_seconds:         # Optional: Stop running the tap when no data
+                                       #           received from wal after certain number of seconds
+                                       #           Default: 10800
+  #break_at_end_lsn:                   # Optional: Stop running the tap if the newly received lsn
+                                       #           is after the max lsn that was detected when the tap started
+                                       #           Default: true
+  #ssl: "true"                         # Optional: Using SSL via postgres sslmode 'require' option.
+                                       #           If the server does not accept SSL connections or the client
+                                       #           certificate is not recognized the connection will fail
+  fastsync_parallelism: <int>          # Optional: size of multiprocessing pool used by FastSync
+                                       #           Min: 1
+                                       #           Default: number of CPU cores
+
+# ------------------------------------------------------------------------------
+# Destination (Target) - Target properties
+# Connection details should be in the relevant target YAML file
+# ------------------------------------------------------------------------------
+target: "snowflake"                    # ID of the target connector where the data will be loaded
+batch_size_rows: 20000                 # Batch size for the stream to optimise load performance
+stream_buffer_size: 0                  # In-memory buffer size (MB) between taps and targets for asynchronous data pipes
+#batch_wait_limit_seconds: 3600        # Optional: Maximum time to wait for `batch_size_rows`. Available only for snowflake target.
+
+# Options only for Fastsync for Snowflake
+#split_large_files: False              # Optional: split large files to multiple pieces and create multipart zip files. (Default: False)
+#split_file_chunk_size_mb: 1000        # Optional: File chunk sizes if `split_large_files` enabled. (Default: 1000)
+#split_file_max_chunks: 20             # Optional: Max number of chunks if `split_large_files` enabled. (Default: 20)
+
+# Options only for Snowflake target
+#split_large_files: False                       # Optional: split large files to multiple pieces and create multipart zip files. (Default: False)
+#split_file_chunk_size_mb: 1000                 # Optional: File chunk sizes if `split_large_files` enabled. (Default: 1000)
+#split_file_max_chunks: 20                      # Optional: Max number of chunks if `split_large_files` enabled. (Default: 20)
+#archive_load_files: False                      # Optional: when enabled, the files loaded to Snowflake will also be stored in `archive_load_files_s3_bucket`
+#archive_load_files_s3_prefix: "archive"        # Optional: When `archive_load_files` is enabled, the archived files will be placed in the archive S3 bucket under this prefix.
+#archive_load_files_s3_bucket: "<BUCKET_NAME>"  # Optional: When `archive_load_files` is enabled, the archived files will be placed in this bucket. (Default: the value of `s3_bucket` in target snowflake YAML)
+
+# Optional defaults for every table-level data-diff block in this tap.
+# Requires backend_db in config.yml.
+#data_diff_defaults:
+#  frequency: "0 */6 * * *"     # Crontab expression: when the check fires
+#  window_start: "-15h"        # Negative offset from fire time for the window start (e.g. -15h = 15h before fire time)
+#  window_end: "-3h"           # Negative offset for the window end; must be closer to fire time than window_start
+#                              # The window must be at least as wide as the cadence, or coverage leaves gaps
+#  statement_timeout: "20min"
+
+
+# ------------------------------------------------------------------------------
+# Source to target Schema mapping
+# ------------------------------------------------------------------------------
+schemas:
+
+  - source_schema: "public"            # Source schema in postgres with tables
+    target_schema: "repl_pg_public"    # Target schema in the destination Data Warehouse
+    target_schema_select_permissions:  # Optional: Grant SELECT on schema and tables that created
+      - grp_stats
+
+    # List of tables to replicate from Postgres to destination Data Warehouse
+    #
+    # Please check the Replication Strategies section in the documentation to understand the differences.
+    # For LOG_BASED replication method you might need to adjust the source PostgreSQL configuration.
+    tables:
+      - table_name: "table_one"
+        replication_method: "LOG_BASED"     # Preferred: replicate changes from the database log
+
+        # OPTIONAL: Load time transformations
+        #transformations:                    
+        #  - column: "last_name"            # Column to transform
+        #    type: "SET-NULL"               # Transformation type
+
+        # OPTIONAL: independently compare a settled UTC window with Snowflake.
+        # Requires backend_db in config.yml. key_column and timestamp_column
+        # must not have load-time transformations.
+        #data_diff:
+        #  schema_version: 1
+        #  name: "hourly-table-one-reconciliation"
+        #  checks: ["schema_compatibility", "row_count", "null_key_count", "duplicate_key_count", "row_checksum"]
+        #  key_column: "id"
+        #  timestamp_column: "last_update"
+        #  compare_columns: ["status", "currency"]
+        #  initial_full_scan: true        # Optional: scan shared history first (default false)
+        #  frequency: "0 */12 * * *"       # Optional table override
+        #  window_start: "-27h"           # Optional table override
+        #  window_end: "-3h"              # Optional table override
+
+      # You can add as many tables as you need...
+      - table_name: "table_tow"
+        replication_method: "LOG_BASED"     # Important! Log based must be enabled in PostgreSQL
+
+  # You can add as many schemas as you need...
+  # Uncommend this if you want replicate tables from multiple schemas
+  #- source_schema: "another_schema_in_postgres" 
+  #  target_schema: "another

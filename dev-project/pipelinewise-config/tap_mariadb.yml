@@ -1,0 +1,171 @@
+---
+
+# ------------------------------------------------------------------------------
+# General Properties
+# ------------------------------------------------------------------------------
+id: "tap_mariadb"                      # Unique identifier of the tap
+name: "Sample MariaDB Database"        # Name of the tap
+type: "tap-mysql"                      # !! THIS SHOULD NOT CHANGE !!
+owner: "somebody@foo.com"              # Data owner to contact
+
+
+# ------------------------------------------------------------------------------
+# Source (Tap) - MySQL/ MariaDB connection details
+# ------------------------------------------------------------------------------
+db_conn:
+  host: "pipelinewise-mysql-source"
+  port: 3306                            # MySQL/ MariaDB port
+  user: "pipelinewise"                  # MySQL/ MariaDB user
+  password: "secret"                    # Plain string or vault encrypted
+  dbname: "mysql_source_db"             # MySQL/ MariaDB database name
+  #filter_dbs: "schema1,schema2"        # Optional: Scan only the required schemas
+                                        #           to improve the performance of
+                                        #           data extraction
+
+
+# ------------------------------------------------------------------------------
+# Destination (Target) - Target properties
+# Connection details should be in the relevant target YAML file
+# ------------------------------------------------------------------------------
+target: "target_postgres"              # ID of the target connector where the data will be loaded
+batch_size_rows: 20000                 # Batch size for the stream to optimise load performance
+stream_buffer_size: 0                  # In-memory buffer size (MB) between taps and targets for asynchronous data pipes
+
+# Default schedule for every table-level data_diff block in this tap.
+# Fires every 6 hours over a 12h window, so consecutive windows overlap and
+# cannot leave a coverage gap. Ends 3h back to let replication settle.
+data_diff_defaults:
+  frequency: "0 */6 * * *"
+  window_start: "-15h"
+  window_end: "-3h"
+  statement_timeout: "20min"
+
+
+# ------------------------------------------------------------------------------
+# Source to target Schema mapping
+# ------------------------------------------------------------------------------
+schemas:
+
+  - source_schema: "mysql_source_db"    # Source schema (aka. database) in MySQL/ MariaDB with tables
+    target_schema: "ppw_dev_tap_mysql"  # Target schema in the destination Data Warehouse
+    #target_schema_select_permissions:  # Optional: Grant SELECT on schema and tables that created
+    #  - grp_read_only
+
+    # List of tables to replicate from MySQL/MariaDB to destination Data Warehouse
+    #
+    # Please check the Replication Strategies section in the documentation to understand the differences.
+    # For LOG_BASED replication method you might need to adjust the source mysql/ mariadb configuration.
+    tables:
+      ### Table with LOG_BASED replication
+      - table_name: "weight_unit"
+        replication_method: "LOG_BASED"   # One of INCREMENTAL, LOG_BASED and FULL_TABLE. (Default: LOG_BASED)
+                                          # Important! Log based must be enabled in MySQL and
+                                          #            requires config adjustments
+                                          # Doc: https://transferwise.github.io/pipelinewise/connectors/taps/mysql.html
+        data_diff:
+          checks:
+            - schema_compatibility
+            - row_count
+            - distinct_key_count
+            - null_key_count
+            - min_key
+            - max_key
+            - row_checksum
+          key_column: "weight_unit_id"
+          timestamp_column: "date_updated"
+          compare_columns:
+            - "weight_unit_name"
+            - "isActive"
+
+      ### Table with INCREMENTAL replication
+      - table_name: "address"
+        replication_method: "INCREMENTAL"
+        replication_key: "date_updated"
+        transformations:
+          - column: "street_number"
+            type: "HASH"
+
+          - column: "zip_code_zip_code_id"
+            type: "MASK-NUMBER"
+            when:
+              - column: 'street_number'
+                regex_match: '[801]'
+
+          - column: "date_created"
+            type: "MASK-DATE"
+        data_diff:
+          checks:
+            - schema_compatibility
+            - row_count
+            - distinct_key_count
+            - null_key_count
+            - min_key
+            - max_key
+          key_column: "address_id"
+          timestamp_column: "date_updated"
+
+      ### Table with FULL_TABLE replication
+      - table_name: "order"
+        replication_method: "FULL_TABLE"
+        data_diff:
+          # Example: fully inline timing — does NOT use data_diff_defaults
+          frequency: "0 */12 * * *"
+          window_start: "-7d"
+          window_end: "-12h"
+          statement_timeout: "30min"
+          checks:
+            - schema_compatibility
+            - row_count
+          key_column: "order_id"
+          timestamp_column: "date_updated"
+
+      ### Table with no primary key
+      - table_name: "no_pk_table"
+        replication_method: "FULL_TABLE"
+
+      ### Table with binary and varbinary columns
+      - table_name: "table_with_binary"
+        replication_method: "LOG_BASED"
+        # Example: overrides only frequency, inherits the rest from data_diff_defaults.
+        # Left commented out: there is no `enabled` flag, so a block means an active check.
+        # data_diff:
+        #   name: "binary-table-drift-check"
+        #   frequency: "0 */12 * * *"
+        #   checks:
+        #     - schema_compatibility
+        #     - row_count
+        #     - distinct_key_count
+        #   key_column: "id"
+        #   timestamp_column: "created_at"
+
+      ### Table with reserved words and columns and special characters
+      - table_name: "edgydata"
+        replication_method: "LOG_BASED"
+        transformations:
+          - column: "case"
+            type: "HASH"
+
+          - column: "group"
+            type: "MASK-NUMBER"
+            when:
+              - column: 'case'
+                equals: 'A'
+
+          - column: "group"
+            type: "SET-NULL"
+            when:
+              - column: 'case'
+                equals: 'B'
+
+      ### Table with reserved word
+      - table_name: "full"
+        replication_method: "INCREMENTAL"
+        replication_key: "begin"
+
+      ### Table with space and mixed upper and lowercase characters
+      - table_name: "table_with_space and UPPERCase"
+        replication_method: "LOG_BASED"
+
+      ### Table with all possible data types
+      - table_name: "all_datatypes"
+        replication_method: "LOG_BASED"

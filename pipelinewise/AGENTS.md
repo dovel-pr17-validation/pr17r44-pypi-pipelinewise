@@ -1,0 +1,199 @@
+# PipelineWise Implementation Instructions
+
+Read root `AGENTS.md` first, then relevant connector, test, E2E, and docs guides.
+
+## Map and boundaries
+
+- `cli/__init__.py`: commands/aliases/dispatch; `cli/pipelinewise.py`:
+  orchestration; `cli/commands.py`: Singer pipeline; `cli/config.py`: YAML
+  validation and generated JSON under
+  `$PIPELINEWISE_CONFIG_DIRECTORY/<target_id>/<tap_id>/` (default
+  `~/.pipelinewise`); `cli/constants.py`: connector types/mappings;
+  `cli/schemas/`: JSON Schemas; `cli/alert_handlers/`: Slack/VictorOps—extend
+  `BaseAlertHandler`. `cli/fastsync_capabilities.py` is the sole format-aware
+  FullSync/PartialSync policy: resolve every native/Iceberg direct route through
+  its operation-specific immutable registry and derive, never duplicate,
+  compatibility views.
+- `fastsync/`: native bulk sync. FullSync replaces tables for initial loads,
+  FULL_TABLE, and explicit `fast_sync`; PartialSync merges filtered ranges for
+  `partial_sync_table`/`sync_start_from`. FullSync supports `tap-mysql`
+  (MariaDB/MySQL), `tap-postgres`, `tap-yugabyte`, and `tap-mongodb` to
+  PostgreSQL/Snowflake; PartialSync supports `tap-mysql`/`tap-postgres`/
+  `tap-yugabyte` to Snowflake. S3 CSV remains Singer-only, so `validate`
+  rejects YugabyteDB LOG_BASED there; YugabyteDB has no managed Iceberg route.
+  Keep MySQL/PostgreSQL→Snowflake lifecycle in `commons/rdbms_to_snowflake.py`
+  and `partialsync/rdbms_to_snowflake.py`;
+  source modules only adapt source construction, mapping, and ordering. Put
+  other shared primitives in `commons/`, imported by `partialsync/`, and align
+  `docs/concept/fastsync.rst`.
+- `backend_db/`: PostgreSQL connections, transactions, Alembic. Required
+  `ddl_user`/`ddl_password` may equal app credentials. It cannot depend on
+  data-diff or replication orchestration; an AST test enforces this.
+- `data_diff/`: may use backend-db, never Singer/FastSync execution. Supports
+  MySQL/MariaDB, PostgreSQL, or YugabyteDB → PostgreSQL/Snowflake; YugabyteDB
+  uses stock psycopg2 in the main venv.
+  Ownership: `adapters.py` dialects; `engine.py` execution; `repository.py`
+  persistence; `runner.py` scheduling/remediation; `config.py`,
+  `comparison.py`, `coverage.py` their named concerns; `runtime.py` generated
+  connector JSON; `credentials.py` private keys. `import_config` persists
+  definitions only after connector generation/discovery. Add database types at
+  the adapter boundary and AST coverage for new dependency seams.
+
+## Backend schema
+
+- Primary keys use concise domain names (`check_id`, `run_id`, `preflight_id`);
+  foreign keys reuse them. Prefix a role only for distinct meaning, e.g.
+  `rerun_of_run_id`, `evaluated_run_id`, or `blocking_run_id`.
+- Backend table/column/constraint/index identifiers must avoid PostgreSQL and
+  Snowflake reserved or limited keywords. Prefer descriptive `is_current` and
+  `trigger_type` even if quoting makes a keyword legal in one database.
+- Data-diff suffixes encode lifecycle: `_definitions` versioned config,
+  `_attempts` executions, `_results` execution detail, `_state` mutable
+  materialized projections, `_events`/`_log` append-only history.
+- `public` is fixed across Alembic, runtime, tests, ERDs and docs; changing it
+  requires a forward migration plan and synchronized updates.
+- Every `NNN_*.py` revision needs a matching `NNN_schema.erd.mmd` Mermaid ERD
+  of the resulting `public` schema. Preserve old ERDs; show FKs on the tables diagram.
+- Migration 001 shipped in `0.78.0`; its `0.82.0` schema finalization is an
+  approved exception requiring coordinated manual updates to existing
+  databases. It is immutable after `0.82.0`; all later changes need a new
+  forward migration and matching ERD.
+- History is append-oriented: insert preflight logs, results, and watermark
+  events; control updates to definitions, run attempts, run-slot state, and
+  watermark state. The database does not enforce immutability.
+- Separate backend app roles receive schema/sequence access plus SELECT, INSERT
+  and UPDATE, not DELETE/DDL. A shared app/DDL identity removes that separation.
+
+## Runtime and data-diff constraints
+
+- PostgreSQL replication sources require **14+** across Singer,
+  FullSync, and PartialSync. Keep the Singer and FastSync connection gates
+  aligned; only deleted-tap slot cleanup may bypass the floor. PostgreSQL
+  targets, the backend, and data-diff connections are separate.
+- Source deletes are always physical. Silently ignore retired deletion-mode
+  options in YAML and bundled PostgreSQL/Snowflake target JSON; do not require
+  reimport or warn. Keep `_SDC_DELETED_AT` as the internal deletion marker,
+  always delete marked rows, and enable target metadata.
+- Dev MySQL requires TLS (`ssl={'': True}`). PyMySQL interpolates bound SQL, so
+  double literal tokens, e.g. `DATE_FORMAT(t, '%%Y')`.
+- SIGTERM normally does not raise `SystemExit`; durable handling needs an
+  installed signal handler, and injected `SystemExit` is not proof.
+- Source preflight accepts a usable index whose first column is the timestamp
+  column without counting rows. Otherwise use an exact count capped at 100,000:
+  allow fewer rows, warn once per physical tap/source/table/timestamp identity
+  from 50,000, and block at 100,000. Remember successful warning deliveries in
+  the backend across retries, restarts, and imports. Schema-only checks are
+  exempt. Use neither query plans nor row estimates, and require a statement
+  timeout. Treat `min_key`/`max_key` values in `dd_run_results` as sensitive;
+  avoid casual logging.
+
+## Decimal precision
+
+- Preserve declared NUMERIC/DECIMAL precision and scale through discovery,
+  Singer schemas, string transport, transformations, FastSync and bookmarks;
+  never round-trip exact values through float. Reuse shared decimal helpers and
+  the target limits in `docs/user_guide/schema_changes.rst`.
+- New columns use the current precise mapping. Retain legacy FLOAT columns by
+  default; `version_legacy_float_columns` versions eligible non-key columns.
+  Keep existing key types and matching staging/MERGE types rather than stopping
+  the tap. FullSync rebuilds use current mappings.
+- Prefer documented lossy fallbacks to skipping rows/columns or failing for
+  unsupported decimal dimensions/values. Preserve key identity as specified by
+  the mapping and keep unaffected routes unchanged. This fallback policy does
+  not relax conversion fidelity, transaction boundaries or recovery safety.
+
+## Snowflake and Iceberg contract
+
+- PipelineWise is the sole automated writer; external reads are allowed. DBA
+  writes/DDL require a maintenance window, stopped affected replication, and no
+  active recovery. Replicated tables/columns must originate via FullSync,
+  PartialSync, target-snowflake, or the supported converter—never arbitrary
+  external schemas or repair-added objects. Before resuming, exceptional repair
+  must preserve v3, copy-on-write, width, metadata, and recovery invariants.
+- Only tap-level `target_table_format: iceberg` plus integer
+  `iceberg_version: 3` creates managed Iceberg; omitted/native creates native.
+  Retain both through Singer
+  handover/evolution. Route compatible Singer taps through target-snowflake and
+  MySQL/PostgreSQL FastSync through the shared publisher; retain native
+  `SWAP WITH`. Only FastSync-capable MySQL/PostgreSQL and taps enabling
+  `native_to_iceberg_conversion` need `data_flattening_max_level: 0` (keep
+  Singer-only defaults such as Salesforce level 10).
+- Carry `iceberg_version` through tap/generated config, publication/recovery,
+  and conversion; reject non-v3 before mutation. Future versions need explicit
+  branches/tests. Through executable hooks, `snowflake_iceberg_versions.py`
+  owns format, canonical types, existing-table checks, semantic options, and
+  copy-on-write level. Align its dependency-free fixture with target-snowflake
+  CREATE/ADD/metadata/transport; new registry entries cannot inherit v3 implicitly.
+- All managed-v3 creation, replacement, converter DDL, and pre-write paths need
+  table-level `ICEBERG_MERGE_ON_READ_BEHAVIOR = 'DISABLED'`; never use deprecated
+  `ENABLE_ICEBERG_MERGE_ON_READ`. Creation also needs
+  `TARGET_FILE_SIZE = 'AUTO'` and
+  `STORAGE_SERIALIZATION_POLICY = 'COMPATIBLE'`. Keep FastSync, conversion,
+  target-snowflake, and the dependency-free contract fixture aligned.
+- Map FastSync string-like/fallback MySQL, MariaDB, and PostgreSQL types to
+  `VARCHAR(134217728)`; before DML, auto-widen compatible narrow native
+  PartialSync targets. target-snowflake uses that width for new native/v3 Singer
+  strings, preserves compatible existing native widths, and requires exact
+  existing-v3 width without implicit widening.
+- Preserve LF, CR, CRLF, tabs, CSV punctuation, and literal backslash sequences
+  through Snowflake FullSync and PartialSync. MySQL/MariaDB export may remove
+  only NUL and uses an `utf8mb4` projection and default connection; PostgreSQL
+  COPY retains Unicode and the same remaining value set.
+- PostgreSQL/MySQL/MariaDB-to-Snowflake FullSync/PartialSync transformations run
+  in the source SELECT before CSV/S3/archive/staging. Preserve legacy FastSync
+  conditional-first ordering and source normalization; reject unsupported
+  semantics before export. Keep range filtering on raw source columns and
+  reject transformed INCREMENTAL keys before reading bookmarks. Version recovery
+  identity when transformation execution semantics change.
+
+## Publication and recovery
+
+- Key recovery by stable source stream, index active attempts by physical
+  target, and hold both locks throughout; reject source, target, staging, role,
+  transformation, or boundary drift. `RecoveryCoordinator` owns target runtime
+  root, store, ordered locks, pointers, persistence, transitions, completion,
+  and abort. Use typed payloads; legacy `context` is only a serialized
+  compatibility projection. Reject invalid transitions. After retained-stage
+  key validation, ambiguous PartialSync MERGE replay rotates submission
+  identity, clears query evidence, durably returns to `staged`, then replans.
+- Reuse `SnowflakeSqlClient` for authentication/query/transactions and
+  `SnowflakeTableInspector` for discovery. Explicitly compose publication,
+  finalization, conversion evidence, and
+  `SnowflakeConversionFinalizationValidator`, kept in
+  `snowflake_iceberg_conversion_recovery.py`; never restore mixin inheritance,
+  dynamic binding, or duplicate catalog inspection.
+- Advance state only after publication, metadata, grants, and cleanup. Persist
+  registered finalization actions only as exact Boolean `true`; require grants,
+  S3/staging cleanup, and replacement metadata restoration. Require a serialized
+  dictionary `source_bookmark`, even empty, and reject malformed recovery.
+  PartialSync needs a PK and rejects transformed-stage NULL or duplicate-key
+  groups before publication.
+- Content mismatches may expose counts/aggregate fingerprints, never source
+  values/samples. Bounded query-history visibility/lookup failures are retryable
+  ambiguity: preserve state/manifest/staging, instruct an unchanged retry, and
+  reserve tracebacks for unexpected errors.
+- Guarded replacement/conversion requires the owning account role; reject
+  database-role ownership and unsafe dependencies/metadata. Conversion is
+  target-only and fidelity-first: exclude external writers for every copy;
+  `eventual=iceberg` also needs a reader/writer outage. Retain the native backup
+  and recover through the manifest. A promoted table with its backup and no
+  manifest is complete; rename a promoted table away only after re-proving that
+  its columns and rows equal the backup, never on drift or transient errors, and
+  never restore `_NATIVE` once a manifest is published. Every saved
+  conversion manifest must load. Copy/validate the whole row multiset,
+  including duplicate keys and representable flaws, without filtering, repair,
+  or deduplication; fail before cutover if v3 cannot represent it exactly.
+  Evidence hashes projected values, so refuse `TIMESTAMP_TZ`, sub-microsecond
+  values, and unreplayable grants before any manifest or DDL. Ownership,
+  comments, and tags match exactly; source grants are a required subset, and
+  extra Iceberg grants are logged, never rolled back.
+- Automatic conversion is tap-root/core-only, inside the PID lock and before
+  writers. Resume pending attempts, restoring interrupted names before refusals;
+  block unsafe names, stale catalogs, incompatible classes and uncoordinated
+  shared writers. Preflight every native candidate before new conversions;
+  preserve completed conversions and stop replication on any failure.
+- `--preflight-only` takes no lock, manifest or DDL. `fast_sync` never converts
+  and refuses native targets before a slot reset, but may rebuild a missing
+  target beside leftover companions. Before changing conversion, read
+  `fastsync/commons/CONVERSION.md` for planning, signals, names, catalogs and
+  shared writers, and `docs/connectors/targets/snowflake_iceberg.rst` for operations.

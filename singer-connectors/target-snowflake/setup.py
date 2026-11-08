@@ -1,0 +1,45 @@
+#!/usr/bin/env python
+
+from setuptools import find_packages, setup
+
+with open('README.md') as f:
+    long_description = f.read()
+
+setup(name="pipelinewise-target-snowflake",
+      version="2.5.2",
+      description="Singer.io target for loading data to Snowflake - PipelineWise compatible",
+      long_description=long_description,
+      long_description_content_type='text/markdown',
+      author="Wise",
+      url='https://github.com/transferwise/pipelinewise-target-snowflake',
+      classifiers=[
+          'License :: OSI Approved :: Apache Software License',
+          'Programming Language :: Python :: 3 :: Only',
+          'Programming Language :: Python :: 3.7',
+          'Programming Language :: Python :: 3.8',
+          'Programming Language :: Python :: 3.9',
+          'Programming Language :: Python :: 3.10',
+      ],
+      py_modules=["target_snowflake"],
+      python_requires='>=3.12.0, <3.13',
+      install_requires=[
+          'pipelinewise-singer-python==3.0.2+pipelinewise.0.96.1',
+          'snowflake-connector-python==4.7.3',
+          'inflection==0.5.1',
+          'joblib==1.5.3',
+          'boto3==1.43.94',
+      ],
+      extras_require={
+          "test": [
+              "ruff==0.16.1",
+              'pytest==9.0.3',
+              'pytest-cov==7.1.0',
+              "python-dotenv==1.2.2"
+          ]
+      },
+      entry_points="""
+          [console_scripts]
+          target-snowflake=target_snowflake:main
+      """,
+      packages=find_packages(exclude=['tests*']),
+      )

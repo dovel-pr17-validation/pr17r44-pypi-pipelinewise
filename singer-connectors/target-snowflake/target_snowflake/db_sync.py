@@ -1,0 +1,1164 @@
+import json
+import sys
+import snowflake.connector
+import re
+from datetime import datetime, timedelta, timezone
+
+from typing import List, Dict, Union, Tuple, Set
+from cryptography.hazmat.primitives import serialization
+
+from singer import get_logger
+from singer.decimal_support import decimal_float_value, decimal_key, is_decimal_schema
+from singer.snowflake_errors import sanitize_snowflake_errors
+from target_snowflake import flattening
+from target_snowflake import managed_iceberg
+from target_snowflake import stream_utils
+from target_snowflake.file_format import FileFormat
+
+from target_snowflake.exceptions import (
+    PrimaryKeyNotFoundException,
+    TableFormatMismatchException,
+    TooManyRecordsException,
+)
+from target_snowflake.upload_clients.s3_upload_client import S3UploadClient
+from target_snowflake.upload_clients.snowflake_upload_client import SnowflakeUploadClient
+
+
+RECORD_UPDATE_MODE_SCHEMA_KEY = 'x-pipelinewise-record-update-mode'
+RECORD_UPDATE_MODE_PATCH = 'PATCH'
+ICEBERG_TABLE_FORMATS = managed_iceberg.ICEBERG_TABLE_FORMATS
+TABLE_FORMAT_MANAGED_ICEBERG_V3 = managed_iceberg.TABLE_FORMAT_MANAGED_ICEBERG_V3
+TABLE_FORMAT_MISSING = managed_iceberg.TABLE_FORMAT_MISSING
+TABLE_FORMAT_NATIVE = managed_iceberg.TABLE_FORMAT_NATIVE
+TABLE_FORMAT_UNSUPPORTED_EXTERNAL_ICEBERG = (
+    managed_iceberg.TABLE_FORMAT_UNSUPPORTED_EXTERNAL_ICEBERG
+)
+column_type = managed_iceberg.column_type
+column_clause = managed_iceberg.column_clause
+safe_column_name = managed_iceberg.safe_column_name
+
+
+def validate_config(config):
+    """Validate configuration"""
+    errors = []
+    s3_required_config_keys = [
+        'account',
+        'dbname',
+        'user',
+        'private_key',
+        'warehouse',
+        's3_bucket',
+        'stage',
+        'file_format'
+    ]
+
+    snowflake_required_config_keys = [
+        'account',
+        'dbname',
+        'user',
+        'private_key',
+        'warehouse',
+        'file_format'
+    ]
+
+    required_config_keys = []
+
+    # Use external stages if both s3_bucket and stage defined
+    if config.get('s3_bucket', None) and config.get('stage', None):
+        required_config_keys = s3_required_config_keys
+    # Use table stage if none s3_bucket and stage defined
+    elif not config.get('s3_bucket', None) and not config.get('stage', None):
+        required_config_keys = snowflake_required_config_keys
+    else:
+        errors.append("Only one of 's3_bucket' or 'stage' keys defined in config. "
+                      "Use both of them if you want to use an external stage when loading data into snowflake "
+                      "or don't use any of them if you want ot use table stages.")
+
+    # Check if mandatory keys exist
+    for k in required_config_keys:
+        if not config.get(k, None):
+            errors.append(f"Required key is missing from config: [{k}]")
+
+    # Check target schema config
+    config_default_target_schema = config.get('default_target_schema', None)
+    config_schema_mapping = config.get('schema_mapping', None)
+    if not config_default_target_schema and not config_schema_mapping:
+        errors.append("Neither 'default_target_schema' (string) nor 'schema_mapping' (object) keys set in config.")
+
+    # Check if archive load files option is using external stages
+    archive_load_files = config.get('archive_load_files', False)
+    if archive_load_files and not config.get('s3_bucket', None):
+        errors.append('Archive load files option can be used only with external s3 stages. Please define s3_bucket.')
+
+    errors.extend(managed_iceberg.validate_table_format_config(config))
+
+    if not isinstance(config.get('version_legacy_float_columns', False), bool):
+        errors.append('version_legacy_float_columns must be true or false')
+
+    return errors
+
+
+def column_trans(schema_property, retained_type=None):
+    """Generate SQL transformed columns syntax"""
+    property_type = schema_property['type']
+    col_trans = ''
+    retained_base_type = re.sub(r'\(.*\)', '', retained_type or '').strip().upper()
+    if retained_base_type in managed_iceberg.SNOWFLAKE_STRING_TYPES:
+        return col_trans
+    if retained_base_type in ('VARIANT', 'OBJECT', 'ARRAY'):
+        return 'parse_json'
+    if retained_base_type in ('BINARY', 'VARBINARY'):
+        return 'to_binary'
+    if 'object' in property_type or 'array' in property_type:
+        col_trans = 'parse_json'
+    elif schema_property.get('format') == 'binary':
+        col_trans = 'to_binary'
+
+    return col_trans
+
+
+def json_element_name(name):
+    """Generate SQL friendly semi structured element reference name"""
+    return f'"{name}"'
+
+
+def primary_column_names(stream_schema_message):
+    """Generate list of SQL friendly PK column names"""
+    return [safe_column_name(p) for p in stream_schema_message['key_properties']]
+
+
+def create_query_tag(query_tag_pattern: str, database: str = None, schema: str = None, table: str = None) -> str:
+    """
+    Generate a string to tag executed queries in Snowflake.
+    Replaces tokens `schema` and `table` with the appropriate values.
+
+    Example with tokens:
+        'Loading data into {schema}.{table}'
+
+    Args:
+        query_tag_pattern:
+        database: optional value to replace {{database}} token in query_tag_pattern
+        schema: optional value to replace {{schema}} token in query_tag_pattern
+        table: optional value to replace {{table}} token in query_tag_pattern
+
+    Returns:
+        String if query_tag_patter defined otherwise None
+    """
+    if not query_tag_pattern:
+        return None
+
+    query_tag = query_tag_pattern
+
+    # replace tokens, taking care of json formatted value compatibility
+    for k, v in {
+        '{{database}}': json.dumps(database.strip('"')).strip('"') if database else None,
+        '{{schema}}': json.dumps(schema.strip('"')).strip('"') if schema else None,
+        '{{table}}': json.dumps(table.strip('"')).strip('"') if table else None
+    }.items():
+        if k in query_tag:
+            query_tag = query_tag.replace(k, v or '')
+
+    return query_tag
+
+
+class DbSync:
+    """DbSync class"""
+
+    def __init__(self, connection_config, stream_schema_message=None, table_cache=None, file_format_type=None):
+        """
+            connection_config:      Snowflake connection details
+
+            stream_schema_message:  An instance of the DbSync class is typically used to load
+                                    data only from a certain singer tap stream.
+
+                                    The stream_schema_message holds the destination schema
+                                    name and the JSON schema that will be used to
+                                    validate every RECORDS messages that comes from the stream.
+                                    Schema validation happening before creating CSV and before
+                                    uploading data into Snowflake.
+
+                                    If stream_schema_message is not defined that we can use
+                                    the DbSync instance as a generic purpose connection to
+                                    Snowflake and can run individual queries. For example
+                                    collecting catalog informations from Snowflake for caching
+                                    purposes.
+        """
+        self.connection_config = connection_config
+        self.stream_schema_message = stream_schema_message
+        self.table_cache = table_cache
+        self.record_update_mode = None
+
+        # logger to be used across the class's methods
+        self.logger = get_logger('target_snowflake')
+
+        # Validate connection configuration
+        config_errors = validate_config(connection_config)
+
+        # Exit if config has errors
+        if len(config_errors) > 0:
+            self.logger.error('Invalid configuration:\n   * %s', '\n   * '.join(config_errors))
+            sys.exit(1)
+
+        if self.connection_config.get('stage', None):
+            stage = stream_utils.stream_name_to_dict(self.connection_config['stage'], separator='.')
+            if not stage['schema_name']:
+                self.logger.error(
+                    "The named external stage object in config has to use the <schema>.<stage_name> format.")
+                sys.exit(1)
+
+        self.schema_name = None
+        self.grantees = None
+        self.file_format = FileFormat(self.connection_config['file_format'], self.query, file_format_type)
+
+        # Init stream schema
+        if self.stream_schema_message is not None:
+            #  Define target schema name.
+            #  --------------------------
+            #  Target schema name can be defined in multiple ways:
+            #
+            #   1: 'default_target_schema' key  : Target schema is the same for every incoming stream if
+            #                                     not specified explicitly for a given stream in
+            #                                     the `schema_mapping` object
+            #   2: 'schema_mapping' key         : Target schema defined explicitly for a given stream.
+            #                                     Example config.json:
+            #                                           "schema_mapping": {
+            #                                               "my_tap_stream_id": {
+            #                                                   "target_schema": "my_snowflake_schema",
+            #                                                   "target_schema_select_permissions": [
+            #                                                       "role_with_select_privs"
+            #                                                   ]
+            #                                               }
+            #                                           }
+            config_default_target_schema = self.connection_config.get('default_target_schema', '').strip()
+            config_schema_mapping = self.connection_config.get('schema_mapping', {})
+
+            stream_name = stream_schema_message['stream']
+            stream_schema_name = stream_utils.stream_name_to_dict(stream_name)['schema_name']
+            if config_schema_mapping and stream_schema_name in config_schema_mapping:
+                self.schema_name = config_schema_mapping[stream_schema_name].get('target_schema')
+            elif config_default_target_schema:
+                self.schema_name = config_default_target_schema
+
+            if not self.schema_name:
+                raise Exception(
+                    "Target schema name not defined in config. "
+                    "Neither 'default_target_schema' (string) nor 'schema_mapping' (object) defines "
+                    f"target schema for {stream_name} stream.")
+
+            #  Define grantees
+            #  ---------------
+            #  Grantees can be defined in multiple ways:
+            #
+            #   1: 'default_target_schema_select_permissions' key  : Grant USAGE and SELECT on every table to a
+            #                                                       given role for every incoming stream unless
+            #                                                       explicitly set in the `schema_mapping` object.
+            #   2: 'target_schema_select_permissions' key          : Roles granted USAGE and SELECT explicitly
+            #                                                       for a given stream.
+            #                                                       Example config.json:
+            #                                                           "schema_mapping": {
+            #                                                               "my_tap_stream_id": {
+            #                                                                   "target_schema": "my_snowflake_schema",
+            #                                                                   "target_schema_select_permissions": [
+            #                                                                       "role_with_select_privs"
+            #                                                                   ]
+            #                                                               }
+            #                                                           }
+            self.grantees = self.connection_config.get('default_target_schema_select_permissions')
+            if config_schema_mapping and stream_schema_name in config_schema_mapping:
+                self.grantees = config_schema_mapping[stream_schema_name].get('target_schema_select_permissions',
+                                                                              self.grantees)
+
+            self.data_flattening_max_level = self.connection_config.get('data_flattening_max_level', 0)
+            self.flatten_schema = flattening.flatten_schema(stream_schema_message['schema'],
+                                                            max_level=self.data_flattening_max_level)
+            self.record_update_mode = stream_schema_message['schema'].get(RECORD_UPDATE_MODE_SCHEMA_KEY)
+
+        # Use external stage
+        if connection_config.get('s3_bucket', None):
+            self.upload_client = S3UploadClient(connection_config)
+        # Use table stage
+        else:
+            self.upload_client = SnowflakeUploadClient(connection_config, self)
+
+    @sanitize_snowflake_errors
+    def open_connection(self):
+        """Open snowflake connection"""
+        stream = None
+        if self.stream_schema_message:
+            stream = self.stream_schema_message['stream']
+
+        return snowflake.connector.connect(
+            user=self.connection_config['user'],
+            authenticator='SNOWFLAKE_JWT',
+            private_key=self._pem2der(self.connection_config['private_key']),
+            account=self.connection_config['account'],
+            database=self.connection_config['dbname'],
+            warehouse=self.connection_config['warehouse'],
+            role=self.connection_config.get('role', None),
+            autocommit=True,
+            session_parameters={
+                # Quoted identifiers should be case sensitive
+                'QUOTED_IDENTIFIERS_IGNORE_CASE': 'FALSE',
+                'QUERY_TAG': create_query_tag(self.connection_config.get('query_tag'),
+                                              database=self.connection_config['dbname'],
+                                              schema=self.schema_name,
+                                              table=self.table_name(stream, False, True))
+            }
+        )
+
+    @sanitize_snowflake_errors
+    def query(self, query: Union[str, List[str]], params: Dict = None, max_records=0) -> List[Dict]:
+        """Run an SQL query in snowflake"""
+        result = []
+        caller_supplied_params = params is not None
+
+        if params is None:
+            params = {}
+        else:
+            if 'LAST_QID' in params:
+                self.logger.warning('LAST_QID is a reserved prepared statement parameter name, '
+                                    'it will be overridden with each executed query!')
+
+        with self.open_connection() as connection:
+            with connection.cursor(snowflake.connector.DictCursor) as cur:
+
+                # Run every query in one transaction if query is a list of SQL
+                if isinstance(query, list):
+                    self.logger.debug('Starting Transaction')
+                    cur.execute("START TRANSACTION")
+                    queries = query
+                else:
+                    queries = [query]
+
+                qid = None
+
+                for q in queries:
+
+                    # update the LAST_QID
+                    params['LAST_QID'] = qid
+
+                    self.logger.debug("Running query: '%s' with Params %s", q, params)
+
+                    if caller_supplied_params or '%(LAST_QID)s' in q:
+                        cur.execute(q, params)
+                    else:
+                        cur.execute(q)
+                    qid = cur.sfqid
+
+                    # Raise exception if returned rows greater than max allowed records
+                    if 0 < max_records < cur.rowcount:
+                        raise TooManyRecordsException(
+                            f"Query returned too many records. This query can return max {max_records} records")
+
+                    result = cur.fetchall()
+
+        return result
+
+    def table_name(self, stream_name, is_temporary, without_schema=False):
+        """Generate target table name"""
+        if not stream_name:
+            return None
+
+        stream_dict = stream_utils.stream_name_to_dict(stream_name)
+        table_name = stream_dict['table_name']
+        sf_table_name = table_name.replace('.', '_').replace('-', '_').lower()
+
+        if is_temporary:
+            sf_table_name = f'{sf_table_name}_temp'
+
+        if without_schema:
+            return f'"{sf_table_name.upper()}"'
+
+        return f'{self.schema_name}."{sf_table_name.upper()}"'
+
+    def record_primary_key_string(self, record):
+        """Generate a unique PK string in the record"""
+        keys = self.effective_key_properties()
+        if not keys and not self.decimal_fields():
+            return None
+        flatten = flattening.flatten_record(record, self.flatten_schema, max_level=self.data_flattening_max_level)
+        self.check_decimal_nan(flatten)
+        if not keys:
+            return None
+
+        key_props = []
+        for key_prop in keys:
+            if key_prop not in flatten or flatten[key_prop] is None:
+                raise PrimaryKeyNotFoundException(
+                    f"Primary key '{key_prop}' does not exist in record or is null. "
+                    f"Available fields: {list(flatten.keys())}"
+                )
+
+            key_value = self.load_column_value(key_prop, flatten[key_prop])
+            key_props.append(
+                decimal_key(key_value)
+                if is_decimal_schema(self.flatten_schema.get(key_prop))
+                else str(key_value)
+            )
+
+        # Delimiters may occur inside key values; encode component boundaries unambiguously.
+        return json.dumps(key_props, ensure_ascii=False, separators=(',', ':'))
+
+    def effective_key_properties(self):
+        """Use the established target identity until FullSync replaces the table."""
+        return getattr(self, '_effective_key_properties', self.stream_schema_message['key_properties'])
+
+    def _retain_existing_primary_keys(self):
+        """Avoid widening legacy MySQL keys over unpopulated historical columns."""
+        self.__dict__.pop('_effective_key_properties', None)
+        keys = self.stream_schema_message['key_properties']
+        if self.connection_config.get('source_tap_type') != 'tap-mysql' or len(keys) < 2:
+            return
+        current_keys = {name.upper() for name in self._get_current_pks()}
+        if current_keys and current_keys < {name.upper() for name in keys}:
+            self._effective_key_properties = [name for name in keys if name.upper() in current_keys]
+            self.logger.warning(
+                'Keeping existing primary key columns %s for stream %s; FullSync adopts the complete source key',
+                ', '.join(self._effective_key_properties), self.stream_schema_message['stream'],
+            )
+
+    def load_column_value(self, name, value):
+        """Keep staged key values and buffered identities on the same live type."""
+        schema = self.flatten_schema.get(name, {})
+        if is_decimal_schema(schema):
+            data_type = self.decimal_load_type(name, schema)
+            base_type = re.sub(r'\(.*\)', '', data_type).strip().upper()
+            if base_type in ('FLOAT', 'DOUBLE', 'DOUBLE PRECISION', 'REAL'):
+                return decimal_float_value(value, 'double precision')
+        retained_type = getattr(self, '_retained_column_types', {}).get(name.upper(), '')
+        retained_base = re.sub(r'\(.*\)', '', retained_type).strip().upper()
+        if schema.get('format') == 'binary' and retained_base in managed_iceberg.SNOWFLAKE_STRING_TYPES:
+            return value.upper() if value is not None else None
+        return value
+
+    def decimal_fields(self):
+        """Cache marked fields once for this immutable stream schema."""
+        if not hasattr(self, '_decimal_fields'):
+            self._decimal_fields = {
+                name: schema for name, schema in self.flatten_schema.items() if is_decimal_schema(schema)
+            }
+        return self._decimal_fields
+
+    def decimal_load_type(self, name, schema):
+        """Use the live FLOAT type when default migration retains a legacy decimal column."""
+        retained_columns = getattr(self, '_retained_column_types', {})
+        if name.upper() in retained_columns:
+            return retained_columns[name.upper()]
+        retained = getattr(self, '_retained_decimal_types', {})
+        return retained.get(name.upper()) or column_type(
+            schema,
+            is_key=name in self.effective_key_properties(),
+            source=self.decimal_source(),
+        )
+
+    def check_decimal_nan(self, record):
+        """Keep ordinary NaN rows while refusing null primary-key identities."""
+        keys = self.effective_key_properties()
+        for name, schema in self.decimal_fields().items():
+            if record.get(name) != 'NaN':
+                continue
+            decimal_type = self.decimal_load_type(name, schema)
+            if re.sub(r'\(.*\)', '', decimal_type).strip().upper() not in (
+                'NUMBER', 'NUMERIC', 'DECIMAL', 'FIXED',
+            ):
+                continue
+            if name in keys:
+                raise ValueError(
+                    f'Cannot load NaN primary key {name}; Snowflake fixed-point numbers cannot represent NaN. '
+                    'Use an explicit lossless text key.'
+                )
+            warned = getattr(self, '_decimal_nan_warned', set())
+            if name not in warned:
+                self.logger.warning(
+                    'Converting NaN to SQL NULL in fixed-point column %s.%s; retaining its row',
+                    self.stream_schema_message['stream'], name,
+                )
+                warned.add(name)
+                self._decimal_nan_warned = warned
+
+    def present_column_names(self, record):
+        """Return flattened schema columns represented by a PATCH record."""
+        schema_properties = self.stream_schema_message['schema'].get('properties', {})
+        present_schema = {
+            'properties': {
+                name: schema_properties[name]
+                for name in record
+                if name in schema_properties
+            }
+        }
+        present_flatten_schema = flattening.flatten_schema(
+            present_schema,
+            max_level=self.data_flattening_max_level,
+        )
+        return tuple(name for name in self.flatten_schema if name in present_flatten_schema)
+
+    def put_to_stage(self, file, stream, count, temp_dir=None):
+        """Upload file to snowflake stage"""
+        self.logger.info('Uploading %d rows to stage', count)
+        return self.upload_client.upload_file(file, stream, temp_dir)
+
+    def delete_from_stage(self, stream, s3_key):
+        """Delete file from snowflake stage"""
+        self.upload_client.delete_object(stream, s3_key)
+
+    def copy_to_archive(self, s3_source_key, s3_archive_key, s3_archive_metadata):
+        """
+        Copy file from snowflake stage to archive.
+
+        s3_source_key: The s3 key to copy, assumed to exist in the bucket configured as 's3_bucket'
+
+        s3_archive_key: The key to use in archive destination. This will be prefixed with the config value
+                        'archive_load_files_s3_prefix'. If none is specified, 'archive' will be used as the prefix.
+
+                        As destination bucket, the config value 'archive_load_files_s3_bucket' will be used. If none is
+                        specified, the bucket configured as 's3_bucket' will be used.
+
+        s3_archive_metadata: This dict will be merged with any metadata in the source file.
+
+        """
+        source_bucket = self.connection_config.get('s3_bucket')
+
+        # Get archive s3_bucket from config, or use same bucket if not specified
+        archive_bucket = self.connection_config.get('archive_load_files_s3_bucket', source_bucket)
+
+        # Determine prefix to use in archive s3 bucket
+        default_archive_prefix = 'archive'
+        archive_prefix = self.connection_config.get('archive_load_files_s3_prefix', default_archive_prefix)
+        prefixed_archive_key = f'{archive_prefix}/{s3_archive_key}'
+
+        copy_source = f'{source_bucket}/{s3_source_key}'
+
+        self.logger.info('Copying %s to archive location %s', copy_source, prefixed_archive_key)
+        self.upload_client.copy_object(copy_source, archive_bucket, prefixed_archive_key, s3_archive_metadata)
+
+    def get_stage_name(self, stream):
+        """Generate snowflake stage name"""
+        stage = self.connection_config.get('stage', None)
+        if stage:
+            return stage
+
+        table_name = self.table_name(stream, False, without_schema=True)
+        return f"{self.schema_name}.%{table_name}"
+
+    def load_file(self, s3_key, count, size_bytes, update_column_names=None):
+        """Load a supported file type from snowflake stage into target table"""
+        stream = self.stream_schema_message['stream']
+        self.logger.info("Loading %d rows into '%s'", count, self.table_name(stream, False))
+
+        # Get list if columns with types
+        columns_with_trans = []
+        retained_columns = getattr(self, '_retained_column_types', {})
+        for name, schema in self.flatten_schema.items():
+            retained_type = retained_columns.get(name.upper())
+            column = {
+                'name': safe_column_name(name),
+                'json_element_name': json_element_name(name),
+                'trans': column_trans(schema, retained_type),
+            }
+            if is_decimal_schema(schema):
+                column.update(
+                    decimal_type=self.decimal_load_type(name, schema),
+                    decimal_key=name in self.effective_key_properties(),
+                )
+            elif retained_type:
+                column['retained_type'] = retained_type
+            columns_with_trans.append(column)
+
+        inserts = 0
+        updates = 0
+
+        # Insert or Update with MERGE command if primary key defined
+        if self.effective_key_properties():
+            try:
+                inserts, updates = self._load_file_merge(
+                    s3_key=s3_key,
+                    stream=stream,
+                    columns_with_trans=columns_with_trans,
+                    update_columns=(
+                        None
+                        if update_column_names is None
+                        else {safe_column_name(name) for name in update_column_names}
+                    ),
+                )
+            except Exception as ex:
+                self.logger.error(
+                    'Error while executing MERGE query for table "%s" in stream "%s"',
+                    self.table_name(stream, False), stream
+                )
+                raise ex
+
+        # Insert only with COPY command if no primary key
+        else:
+            try:
+                inserts, updates = (
+                    self._load_file_copy(
+                        s3_key=s3_key,
+                        stream=stream,
+                        columns_with_trans=columns_with_trans
+                    ),
+                    0,
+                )
+            except Exception as ex:
+                self.logger.error(
+                    'Error while executing COPY query for table "%s" in stream "%s"',
+                    self.table_name(stream, False), stream
+                )
+                raise ex
+
+        self.logger.info(
+            'Loading into %s: %s',
+            self.table_name(stream, False),
+            json.dumps({'inserts': inserts, 'updates': updates, 'size_bytes': size_bytes})
+        )
+
+    @sanitize_snowflake_errors
+    def _load_file_merge(self, s3_key, stream, columns_with_trans, update_columns=None) -> Tuple[int, int]:
+        # MERGE does insert and update
+        inserts = 0
+        updates = 0
+        with self.open_connection() as connection:
+            with connection.cursor(snowflake.connector.DictCursor) as cur:
+                merge_sql = self.file_format.formatter.create_merge_sql(
+                    table_name=self.table_name(stream, False),
+                    stage_name=self.get_stage_name(stream),
+                    s3_key=s3_key,
+                    file_format_name=self.connection_config['file_format'],
+                    columns=columns_with_trans,
+                    pk_merge_condition=self.primary_key_merge_condition(),
+                    update_columns=update_columns,
+                )
+                self.logger.debug('Running query: %s', merge_sql)
+                cur.execute(merge_sql)
+                # Get number of inserted and updated records
+                results = cur.fetchall()
+                if len(results) > 0:
+                    inserts = results[0].get('number of rows inserted', 0)
+                    updates = results[0].get('number of rows updated', 0)
+        return inserts, updates
+
+    @sanitize_snowflake_errors
+    def _load_file_copy(self, s3_key, stream, columns_with_trans) -> int:
+        # COPY does insert only
+        inserts = 0
+        with self.open_connection() as connection:
+            with connection.cursor(snowflake.connector.DictCursor) as cur:
+                copy_sql = self.file_format.formatter.create_copy_sql(
+                    table_name=self.table_name(stream, False),
+                    stage_name=self.get_stage_name(stream),
+                    s3_key=s3_key,
+                    file_format_name=self.connection_config['file_format'],
+                    columns=columns_with_trans
+                )
+                self.logger.debug('Running query: %s', copy_sql)
+                cur.execute(copy_sql)
+                # Get number of inserted records - COPY does insert only
+                results = cur.fetchall()
+                if len(results) > 0:
+                    inserts = results[0].get('rows_loaded', 0)
+        return inserts
+
+    def primary_key_merge_condition(self):
+        """Generate SQL join condition on primary keys for merge SQL statements"""
+        names = [safe_column_name(name) for name in self.effective_key_properties()]
+        return ' AND '.join([f's.{c} = t.{c}' for c in names])
+
+    def column_names(self):
+        """Get list of columns in the schema"""
+        return [safe_column_name(name) for name in self.flatten_schema]
+
+    def decimal_source(self):
+        """Use the per-tap runtime config to apply PostgreSQL key identity policy."""
+        config = getattr(self, 'connection_config', {})
+        return 'postgres' if config.get('source_tap_type') == 'tap-postgres' else None
+
+    def create_table_query(self, is_temporary=False):
+        """Generate CREATE TABLE SQL"""
+        stream_schema_message = self.stream_schema_message
+        columns = [
+            column_clause(
+                name,
+                schema,
+                is_iceberg_table=False,
+                is_key=name in stream_schema_message.get('key_properties', []),
+                source=self.decimal_source(),
+            )
+            for (name, schema) in self.flatten_schema.items()
+        ]
+
+        primary_key = []
+        if len(stream_schema_message.get('key_properties', [])) > 0:
+            pk_list = ', '.join(primary_column_names(stream_schema_message))
+            primary_key = [f"PRIMARY KEY({pk_list})"]
+
+        p_temp = 'TEMP ' if is_temporary else ''
+        p_table_name = self.table_name(stream_schema_message['stream'], is_temporary)
+        p_columns = ', '.join(columns + primary_key)
+        p_extra = 'data_retention_time_in_days = 0 ' if is_temporary else 'data_retention_time_in_days = 1 '
+        return f'CREATE {p_temp}TABLE IF NOT EXISTS {p_table_name} ({p_columns}) {p_extra}'
+
+    def create_iceberg_table_query(self, iceberg_version):
+        """Generate managed-version DDL for an explicit Iceberg configuration."""
+        if not managed_iceberg.is_supported_iceberg_version(iceberg_version):
+            raise ValueError('Iceberg table creation requires integer version 3')
+
+        stream_schema_message = self.stream_schema_message
+        columns = [
+            column_clause(
+                name,
+                schema,
+                is_iceberg_table=True,
+                iceberg_version=iceberg_version,
+                is_key=name in stream_schema_message.get('key_properties', []),
+                source=self.decimal_source(),
+            )
+            for (name, schema) in self.flatten_schema.items()
+        ]
+
+        primary_key = []
+        if len(stream_schema_message.get('key_properties', [])) > 0:
+            pk_list = ', '.join(primary_column_names(stream_schema_message))
+            primary_key = [f"PRIMARY KEY({pk_list})"]
+
+        p_table_name = self.table_name(stream_schema_message['stream'], is_temporary=False)
+        return managed_iceberg.create_iceberg_table_query(
+            p_table_name,
+            columns,
+            primary_key,
+            iceberg_version,
+        )
+
+    def grant_usage_on_schema(self, schema_name, grantee):
+        """Grant usage on schema"""
+        query = f"GRANT USAGE ON SCHEMA {schema_name} TO ROLE {grantee}"
+        self.logger.info("Granting USAGE privilege on '%s' schema to '%s'... %s", schema_name, grantee, query)
+        self.query(query)
+
+    def grant_select_on_all_tables_in_schema(self, schema_name, grantee):
+        """Grant select on all tables in schema"""
+        query = f"GRANT SELECT ON ALL TABLES IN SCHEMA {schema_name} TO ROLE {grantee}"
+        self.logger.info(
+            "Granting SELECT ON ALL TABLES privilege on '%s' schema to '%s'... %s", schema_name, grantee, query)
+        self.query(query)
+
+    @classmethod
+    def grant_privilege(cls, schema, grantees, grant_method):
+        """Grant privileges on target schema"""
+        if isinstance(grantees, list):
+            for grantee in grantees:
+                grant_method(schema, grantee)
+        elif isinstance(grantees, str):
+            grant_method(schema, grantees)
+
+    def delete_rows(self, stream):
+        """Hard delete rows from target table"""
+        table = self.table_name(stream, False)
+        query = f"DELETE FROM {table} WHERE _sdc_deleted_at IS NOT NULL"
+        self.logger.info("Deleting rows from '%s' table... %s", table, query)
+        self.logger.info('DELETE %d', len(self.query(query)))
+
+    def create_schema_if_not_exists(self):
+        """Create target schema if not exists"""
+        schema_name = self.schema_name
+        schema_rows = 0
+
+        # table_cache is an optional pre-collected list of available objects in snowflake
+        if self.table_cache:
+            schema_rows = list(filter(lambda x: x['SCHEMA_NAME'] == schema_name.upper(), self.table_cache))
+        # Query realtime if not pre-collected
+        else:
+            schema_rows = self.query(f"SHOW SCHEMAS LIKE '{schema_name.upper()}'")
+
+        if len(schema_rows) == 0:
+            query = f"CREATE SCHEMA IF NOT EXISTS {schema_name}"
+            self.logger.info("Schema '%s' does not exist. Creating... %s", schema_name, query)
+            self.query(query)
+
+            self.grant_privilege(schema_name, self.grantees, self.grant_usage_on_schema)
+
+            # Refresh columns cache if required
+            if self.table_cache:
+                self.table_cache = self.get_table_columns(table_schemas=[self.schema_name])
+
+    def get_tables(self, table_schemas=None):
+        """Get list of tables of certain schema(s) from snowflake metadata"""
+        tables = []
+        if table_schemas:
+            for schema in table_schemas:
+                queries = []
+
+                # Get tables in schema
+                show_tables = f"SHOW TERSE TABLES IN SCHEMA {self.connection_config['dbname']}.{schema}"
+
+                # Convert output of SHOW TABLES to table
+                select = """
+                    SELECT
+                        "schema_name" AS schema_name
+                        ,"name"       AS table_name
+                    FROM TABLE(RESULT_SCAN(%(LAST_QID)s))
+                """
+                queries.extend([show_tables, select])
+
+                # Run everything in one transaction
+                try:
+                    tables = self.query(queries, max_records=99999)
+
+                # Catch exception when schema not exists and SHOW TABLES throws a ProgrammingError
+                # Regexp to extract snowflake error code and message from the exception message
+                # Do nothing if schema not exists
+                except snowflake.connector.errors.ProgrammingError as exc:
+                    if not re.match(r'002043 \(02000\):.*\n.*does not exist.*', str(sys.exc_info()[1])):
+                        raise exc
+        else:
+            raise Exception("Cannot get table columns. List of table schemas empty")
+
+        return tables
+
+    def discover_table_format(self, schema_name, table_name):
+        """Return the exact physical Snowflake format of a PipelineWise table."""
+        return managed_iceberg.discover_table_format(
+            self.query,
+            self.connection_config['dbname'],
+            schema_name,
+            table_name,
+        )
+
+    def check_iceberg(self, schema_name, table_name) -> bool:
+        """Return whether an exact existing table is physically Iceberg."""
+        return self.discover_table_format(schema_name, table_name) in ICEBERG_TABLE_FORMATS
+
+    def get_table_columns(self, table_schemas=None):
+        """Get list of columns and tables of certain schema(s) from snowflake metadata"""
+        table_columns = []
+        if table_schemas:
+            for schema in table_schemas:
+                queries = []
+
+                # Get column data types by SHOW COLUMNS
+                show_columns = f"SHOW COLUMNS IN SCHEMA {self.connection_config['dbname']}.{schema}"
+
+                # Convert output of SHOW COLUMNS to table and insert results into the cache COLUMNS table
+                #
+                # ----------------------------------------------------------------------------------------
+                # Character and numeric columns display their generic data type rather than their defined
+                # data type (i.e. TEXT for all character types, FIXED for all fixed-point numeric types,
+                # and REAL for all floating-point numeric types).
+                # Further info at https://docs.snowflake.net/manuals/sql-reference/sql/show-columns.html
+                # ----------------------------------------------------------------------------------------
+                select = """
+                    SELECT "schema_name" AS schema_name
+                          ,"table_name"  AS table_name
+                          ,"column_name" AS column_name
+                          ,CASE PARSE_JSON("data_type"):type::varchar
+                             WHEN 'FIXED' THEN 'NUMBER'
+                             WHEN 'REAL'  THEN 'FLOAT'
+                             ELSE PARSE_JSON("data_type"):type::varchar
+                          END data_type
+                          ,PARSE_JSON("data_type"):precision::integer AS numeric_precision
+                          ,PARSE_JSON("data_type"):scale::integer AS numeric_scale
+                          ,PARSE_JSON("data_type"):length::integer AS type_length
+                      FROM TABLE(RESULT_SCAN(%(LAST_QID)s))
+                """
+
+                queries.extend([show_columns, select])
+
+                # Run everything in one transaction
+                try:
+                    columns = self.query(queries, max_records=99999)
+
+                    if not columns:
+                        self.logger.warning('No columns discovered in the schema "%s"',
+                                            f"{self.connection_config['dbname']}.{schema}")
+                    else:
+                        table_columns.extend(columns)
+
+                # Catch exception when schema not exists and SHOW COLUMNS throws a ProgrammingError
+                # Regexp to extract snowflake error code and message from the exception message
+                # Do nothing if schema not exists
+                except snowflake.connector.errors.ProgrammingError as exc:
+                    if not re.match(r'002003 \(02000\):.*\n.*does not exist or not authorized.*',
+                                    str(sys.exc_info()[1])):
+                        raise exc
+
+        else:
+            raise Exception("Cannot get table columns. List of table schemas empty")
+
+        return table_columns
+
+    def refresh_table_cache(self):
+        """Refreshes the internal table cache"""
+        self.table_cache = self.get_table_columns([self.schema_name])
+
+    def update_columns(self, is_iceberg_table=False, iceberg_version=None):
+        """Adds required but not existing columns the target table according to the schema"""
+        stream_schema_message = self.stream_schema_message
+        stream = stream_schema_message['stream']
+        table_name = self.table_name(stream, False, True)
+        all_table_columns = []
+
+        # Later SCHEMA messages may replace DbSync while retaining the startup cache.
+        # Decimal dimensions must be compared with the table after earlier DDL.
+        has_decimals = any(is_decimal_schema(schema) for schema in self.flatten_schema.values())
+        if self.table_cache and not has_decimals:
+            all_table_columns = self.table_cache
+        else:
+            all_table_columns = self.get_table_columns(table_schemas=[self.schema_name])
+
+        # Find the specific table
+        columns = list(filter(lambda x: x['SCHEMA_NAME'] == self.schema_name.upper() and
+                                        f'"{x["TABLE_NAME"].upper()}"' == table_name,
+                              all_table_columns))
+
+        plan = managed_iceberg.plan_column_changes(
+            self.flatten_schema,
+            {
+                column['COLUMN_NAME']: self._existing_column_type(column)
+                for column in columns
+            },
+            is_iceberg_table,
+            iceberg_version,
+            key_properties=stream_schema_message['key_properties'],
+            source=self.decimal_source(),
+            version_legacy_float_columns=self.connection_config.get(
+                'version_legacy_float_columns', False
+            ),
+        )
+        self._retained_decimal_types = dict(plan.retained_decimal_types)
+        self._retained_column_types = dict(plan.retained_column_types)
+
+        for column in plan.additions:
+            self.add_column(column, stream, is_iceberg_table)
+
+        existing_names = {column['COLUMN_NAME'].upper() for column in columns} | {
+            name.upper() for name in self.flatten_schema
+        }
+        for (column_name, column) in plan.replacements:
+            archived_name = self.version_column(column_name, stream, is_iceberg_table, existing_names)
+            existing_names.add(archived_name)
+            self.add_column(column, stream, is_iceberg_table)
+
+        # Refresh table cache if required
+        if self.table_cache and (plan.additions or plan.replacements):
+            self.table_cache = self.get_table_columns(table_schemas=[self.schema_name])
+
+    def drop_column(self, column_name, stream):
+        """Drops column from an existing table"""
+        drop_column = f"ALTER TABLE {self.table_name(stream, False)} DROP COLUMN {column_name}"
+        self.logger.info('Dropping column: %s', drop_column)
+        self.query(drop_column)
+
+    @staticmethod
+    def _existing_column_type(column):
+        """Retain fixed-point dimensions while keeping legacy non-decimal comparisons."""
+        data_type = column['DATA_TYPE'].upper()
+        precision = column.get('NUMERIC_PRECISION')
+        scale = column.get('NUMERIC_SCALE')
+        if data_type in ('NUMBER', 'NUMERIC', 'DECIMAL', 'FIXED') and precision is not None and scale is not None:
+            return f'NUMBER({precision},{scale})'
+        type_length = column.get('TYPE_LENGTH')
+        if (
+            type_length is not None
+            and (
+                data_type in managed_iceberg.SNOWFLAKE_STRING_TYPES
+                or data_type in ('BINARY', 'VARBINARY')
+            )
+        ):
+            return f'{data_type}({type_length})'
+        return data_type
+
+    def version_column(self, column_name, stream, is_iceberg_table=False, existing_names=()):
+        """Versions a column in an existing table"""
+        p_table_name = self.table_name(stream, False)
+        p_column_name = column_name.replace("\"", "")
+        version_time = datetime.now(timezone.utc)
+        while True:
+            p_ver_time = version_time.strftime('%Y%m%d_%H%M%S_%f')
+            archived_name = f'{p_column_name[:232]}_{p_ver_time}'
+            if archived_name not in existing_names:
+                break
+            version_time += timedelta(microseconds=1)
+
+        if is_iceberg_table:
+            version_column = (
+                f'ALTER ICEBERG TABLE {p_table_name} RENAME COLUMN '
+                f'{column_name} TO "{archived_name}"'
+            )
+        else:
+            version_column = (
+                f'ALTER TABLE {p_table_name} RENAME COLUMN {column_name} '
+                f'TO "{archived_name}"'
+            )
+        self.logger.warning(
+            'Column "%s" in table "%s" has been renamed to "%s"',
+            column_name,
+            p_table_name,
+            archived_name,
+        )
+        self.query(version_column)
+        return archived_name
+
+    def add_column(self, column, stream, is_iceberg_table=False):
+        """Adds a new column to an existing table"""
+
+        if is_iceberg_table:
+            add_column = f"ALTER ICEBERG TABLE {self.table_name(stream, False)} ADD COLUMN {column}"
+        else:
+            add_column = f"ALTER TABLE {self.table_name(stream, False)} ADD COLUMN {column}"
+        self.logger.warning('Column "%s" added to table "%s"', column, self.table_name(stream, False))
+        self.query(add_column)
+
+    def sync_table(self):
+        """Creates or alters the target table according to the schema"""
+        self.__dict__.pop('_effective_key_properties', None)
+        for name, schema in self.flatten_schema.items():
+            if is_decimal_schema(schema):
+                precision, scale = schema['decimal']['precision'], schema['decimal']['scale']
+                mapped_type = column_type(
+                    schema, is_key=name in self.stream_schema_message['key_properties'], source=self.decimal_source(),
+                )
+                if mapped_type != f'NUMERIC({precision},{scale})':
+                    self.logger.warning(
+                        'Decimal fallback for %s.%s: source NUMERIC(%s,%s) maps to %s',
+                        self.stream_schema_message['stream'], name, precision, scale, mapped_type,
+                    )
+        stream_schema_message = self.stream_schema_message
+        stream = stream_schema_message['stream']
+        table_name_with_schema = self.table_name(stream, False)
+
+        iceberg_stream_dict = stream_utils.stream_name_to_dict(stream)
+        iceberg_table_name = iceberg_stream_dict['table_name']
+        iceberg_table_name = iceberg_table_name.replace('.', '_').replace('-', '_').upper()
+        physical_format = self.discover_table_format(self.schema_name, iceberg_table_name)
+        requested = managed_iceberg.requested_table_format(self.connection_config)
+        expected_format = requested.expected_physical_format
+
+        if physical_format not in (TABLE_FORMAT_MISSING, expected_format):
+            raise TableFormatMismatchException(
+                f'Table {table_name_with_schema} is {physical_format}, but {requested.config_source} '
+                f'requires {expected_format}'
+            )
+
+        if physical_format == TABLE_FORMAT_MISSING:
+            if requested.is_iceberg:
+                iceberg_version = requested.iceberg_version
+                query = self.create_iceberg_table_query(iceberg_version)
+                is_iceberg_table = True
+                self.logger.info('Table %s does not exist. Creating as Iceberg table...', table_name_with_schema)
+            else:
+                query = self.create_table_query()
+                iceberg_version = None
+                is_iceberg_table = False
+                self.logger.info('Table %s does not exist. Creating...', table_name_with_schema)
+            self.query(query)
+
+            self._verify_created_table_format(
+                table_name_with_schema,
+                iceberg_table_name,
+                expected_format,
+            )
+
+            self.grant_privilege(self.schema_name, self.grantees, self.grant_select_on_all_tables_in_schema)
+
+            # Refresh columns cache if required
+            if self.table_cache:
+                self.table_cache = self.get_table_columns(table_schemas=[self.schema_name])
+        else:
+            self.logger.info('Table %s exists', table_name_with_schema)
+            is_iceberg_table = physical_format in ICEBERG_TABLE_FORMATS
+            iceberg_version = requested.iceberg_version
+            self._retain_existing_primary_keys()
+            self.update_columns(is_iceberg_table, iceberg_version)
+
+        if not is_iceberg_table:
+            self._refresh_table_pks()
+
+    def _verify_created_table_format(
+        self,
+        table_name_with_schema,
+        iceberg_table_name,
+        expected_format,
+    ):
+        # IF NOT EXISTS can lose a race to a table created in another format.
+        created_format = self.discover_table_format(self.schema_name, iceberg_table_name)
+        if created_format != expected_format:
+            config_source = (
+                'target_table_format'
+                if 'target_table_format' in self.connection_config
+                else 'the default target format'
+            )
+            raise TableFormatMismatchException(
+                f'Table {table_name_with_schema} is {created_format} after creation, but '
+                f'{config_source} requires {expected_format}'
+            )
+
+    def _refresh_table_pks(self):
+        """
+        Refresh table PK constraints by either dropping or adding PK based on changes to `key_properties` of the
+        stream schema.
+        The non-nullability of PK column is also dropped.
+        """
+        table_name = self.table_name(self.stream_schema_message['stream'], False)
+        self.logger.info('Refreshing Table %s PK', table_name)
+        current_pks = self._get_current_pks()
+        new_pks = set(pk.upper() for pk in self.effective_key_properties())
+
+        queries = []
+
+        self.logger.debug('Table: %s, Current PKs: %s | New PKs: %s ',
+                          self.stream_schema_message['stream'],
+                          current_pks,
+                          new_pks
+                          )
+
+        if not new_pks and current_pks:
+            self.logger.info('Table "%s" currently has PK constraint, but we need to drop it.', table_name)
+            queries.append(f'alter table {table_name} drop primary key;')
+
+        elif new_pks != current_pks:
+            self.logger.info('Changes detected in pk columns of table "%s", need to refresh PK.', table_name)
+            pk_list = ', '.join([safe_column_name(col) for col in new_pks])
+
+            if current_pks:
+                queries.append(f'alter table {table_name} drop primary key;')
+
+            queries.append(f'alter table {table_name} add primary key({pk_list});')
+
+        # For now, we don't wish to enforce non-nullability on the pk columns
+        for pk in current_pks.union(new_pks):
+            queries.append(f'alter table {table_name} alter column {safe_column_name(pk)} drop not null;')
+
+        self.query(queries)
+
+    def _get_current_pks(self) -> Set[str]:
+        """
+        Finds the stream's current Pk in Snowflake.
+        Returns: Set of pk columns, in upper case. Empty means table has no PK
+        """
+        table_name = self.table_name(self.stream_schema_message['stream'], False)
+
+        show_query = f"show primary keys in table {self.connection_config['dbname']}.{table_name};"
+
+        columns = set()
+        try:
+            columns = self.query(show_query)
+
+        # Catch exception when schema not exists and SHOW TABLES throws a ProgrammingError
+        # Regexp to extract snowflake error code and message from the exception message
+        # Do nothing if schema not exists
+        except snowflake.connector.errors.ProgrammingError as exc:
+            if not re.match(r'002043 \(02000\):.*\n.*does not exist.*', str(sys.exc_info()[1])):
+                raise exc
+
+        return set(col['column_name'] for col in columns)
+
+    def _pem2der(self, pem_file: str, password: str = None) -> bytes:
+        """Convert Key PEM format to DER format"""
+        with open(pem_file, 'rb') as key_file:
+            p_key = serialization.load_pem_private_key(
+                key_file.read(),
+                password=password,
+            )
+        der_key = p_key.private_bytes(
+            encoding=serialization.Encoding.DER,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption())
+        return der_key

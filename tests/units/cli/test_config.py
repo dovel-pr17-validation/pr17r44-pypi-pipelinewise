@@ -1,0 +1,1188 @@
+import json
+import os
+import shutil
+import pytest
+
+from pipelinewise import cli
+from pipelinewise.cli.config import Config
+from pipelinewise.cli.errors import InvalidConfigException
+
+PIPELINEWISE_TEST_HOME = '/tmp/.pipelinewise'
+
+
+def _table_format_target(**connection_settings):
+    return {
+        'id': 'test_target',
+        'name': 'Test target',
+        'type': 'target-snowflake',
+        'db_conn': {
+            'account': 'account',
+            'dbname': 'database',
+            'user': 'user',
+            'private_key': 'private-key',
+            'warehouse': 'warehouse',
+            's3_bucket': 'bucket',
+            's3_key_prefix': 'prefix/',
+            'stage': 'schema.stage',
+            'file_format': 'file-format',
+            **connection_settings,
+        },
+    }
+
+
+# Todo: Inherit from unittest.TestCase
+class TestConfig:
+    """
+    Unit Tests for PipelineWise CLI Config class
+    """
+
+    @staticmethod
+    def _get_config(json_config_dir, yaml_path):
+        # Load a full configuration set from YAML files
+        yaml_config_dir = f'{os.path.dirname(__file__)}/resources/{yaml_path}'
+        vault_secret = f'{os.path.dirname(__file__)}/resources/vault-secret.txt'
+        return Config.from_yamls(json_config_dir, yaml_config_dir, vault_secret)
+
+    @staticmethod
+    def _get_json_files_path(tap_id, json_config_dir):
+        return {
+            'main_config_json': f'{json_config_dir}/config.json',
+            'target_config_json': f'{json_config_dir}/test_snowflake_target/config.json',
+            'tap_config_json': f'{json_config_dir}/test_snowflake_target/{tap_id}/config.json',
+            'tap_inheritable_config_json': f'{json_config_dir}/test_snowflake_target/{tap_id}/inheritable_config.json',
+            'tap_selection_json': f'{json_config_dir}/test_snowflake_target/{tap_id}/selection.json',
+            'tap_transformation_json': f'{json_config_dir}/test_snowflake_target/{tap_id}/transformation.json',
+        }
+
+    def test_constructor(self):
+        """Test Config construction functions"""
+        config = Config(PIPELINEWISE_TEST_HOME)
+
+        # config dir and path should be generated automatically
+        assert config.config_dir == PIPELINEWISE_TEST_HOME
+        assert config.config_path == '{}/config.json'.format(PIPELINEWISE_TEST_HOME)
+        assert config.targets == {}
+
+    @pytest.mark.parametrize('value', [True, False, None, 'false', 0])
+    @pytest.mark.parametrize('kind', ['tap', 'target'])
+    @pytest.mark.parametrize('placement', ['root', 'db_conn'])
+    def test_legacy_hard_delete_is_ignored_during_config_generation(self, tmp_path, value, kind, placement):
+        """Legacy options remain valid without restoring configurable retention."""
+        tap = self._table_format_tap()
+        target = self._table_format_target()
+        settings = tap if kind == 'tap' else target
+        (settings if placement == 'root' else settings['db_conn'])['hard_delete'] = value
+        yaml_dir = tmp_path / 'yaml'
+        yaml_dir.mkdir()
+        (yaml_dir / 'tap_test.yml').write_text(json.dumps(tap), encoding='utf-8')
+        (yaml_dir / 'target_test.yml').write_text(json.dumps(target), encoding='utf-8')
+        runtime_dir = tmp_path / 'runtime'
+
+        config = Config.from_yamls(str(runtime_dir), str(yaml_dir))
+        assert 'hard_delete' not in config.generate_inheritable_config(tap)
+        cli.utils.validate(settings, cli.utils.load_schema(kind))
+
+    def test_connector_files(self):
+        """Every singer connector must have a list of JSON files at certain locations"""
+        assert Config.get_connector_files('/var/singer-connector') == {
+            'config': '/var/singer-connector/config.json',
+            'inheritable_config': '/var/singer-connector/inheritable_config.json',
+            'properties': '/var/singer-connector/properties.json',
+            'state': '/var/singer-connector/state.json',
+            'transformation': '/var/singer-connector/transformation.json',
+            'selection': '/var/singer-connector/selection.json',
+            'pidfile': '/var/singer-connector/pipelinewise.pid',
+        }
+
+    def test_target_runtime_identifies_source_for_legacy_and_numeric_keys(self):
+        """Supported targets receive source identity for their key compatibility policy."""
+        config = Config(PIPELINEWISE_TEST_HOME)
+        postgres_tap = self._table_format_tap()
+        mysql_tap = self._table_format_tap(type='tap-mysql')
+
+        assert config.generate_inheritable_config(postgres_tap, 'target-snowflake')['source_tap_type'] == 'tap-postgres'
+        assert 'source_tap_type' not in config.generate_inheritable_config(postgres_tap, 'target-postgres')
+        for target_type in ('target-snowflake', 'target-postgres'):
+            assert config.generate_inheritable_config(mysql_tap, target_type)['source_tap_type'] == 'tap-mysql'
+        assert 'source_tap_type' not in config.generate_inheritable_config(mysql_tap, 'target-s3-csv')
+        assert 'source_tap_type' not in config.generate_inheritable_config(
+            self._table_format_tap(type='tap-salesforce'), 'target-snowflake',
+        )
+
+    @pytest.mark.parametrize('tap_type', ['tap-mysql', 'tap-postgres'])
+    @pytest.mark.parametrize('enabled', [False, True])
+    def test_decimal_float_versioning_is_tap_scoped_and_reaches_snowflake(self, tap_type, enabled):
+        setting = Config.VERSION_LEGACY_FLOAT_COLUMNS_SETTING
+        tap = self._table_format_tap(type=tap_type, **{setting: enabled})
+        target = self._table_format_target()
+
+        Config.validate_snowflake_decimal_versioning(tap, target)
+        assert Config(PIPELINEWISE_TEST_HOME).generate_inheritable_config(
+            tap, 'target-snowflake',
+        )[setting] is enabled
+
+    def test_decimal_float_versioning_defaults_false_only_for_supported_snowflake_routes(self):
+        setting = Config.VERSION_LEGACY_FLOAT_COLUMNS_SETTING
+        config = Config(PIPELINEWISE_TEST_HOME)
+
+        assert config.generate_inheritable_config(
+            self._table_format_tap(type='tap-postgres'), 'target-snowflake',
+        )[setting] is False
+        assert setting not in config.generate_inheritable_config(
+            self._table_format_tap(type='tap-postgres'), 'target-postgres',
+        )
+        assert setting not in config.generate_inheritable_config(
+            self._table_format_tap(type='tap-salesforce'), 'target-snowflake',
+        )
+
+    @pytest.mark.parametrize('value', [None, 0, 1, 'false'])
+    def test_decimal_float_versioning_schema_rejects_non_booleans(self, value):
+        with pytest.raises(InvalidConfigException):
+            cli.utils.validate(
+                self._table_format_tap(**{
+                    Config.VERSION_LEGACY_FLOAT_COLUMNS_SETTING: value,
+                }),
+                cli.utils.load_schema('tap'),
+            )
+
+    @pytest.mark.parametrize('placement', ['root', 'db_conn'])
+    def test_decimal_float_versioning_rejects_shared_target_placement(self, placement):
+        setting = Config.VERSION_LEGACY_FLOAT_COLUMNS_SETTING
+        target = self._table_format_target()
+        (target if placement == 'root' else target['db_conn'])[setting] = True
+
+        with pytest.raises(InvalidConfigException, match=setting):
+            Config.validate_snowflake_decimal_versioning_placement(target)
+
+    def test_decimal_float_versioning_rejects_tap_connection_placement(self):
+        setting = Config.VERSION_LEGACY_FLOAT_COLUMNS_SETTING
+        tap = self._table_format_tap(db_conn={setting: True})
+
+        with pytest.raises(InvalidConfigException, match='tap root'):
+            Config.validate_snowflake_decimal_versioning(tap, self._table_format_target())
+
+    @pytest.mark.parametrize('tap_type,target_type', [
+        ('tap-salesforce', 'target-snowflake'),
+        ('tap-postgres', 'target-postgres'),
+    ])
+    def test_decimal_float_versioning_rejects_unsupported_routes(self, tap_type, target_type):
+        setting = Config.VERSION_LEGACY_FLOAT_COLUMNS_SETTING
+        tap = self._table_format_tap(type=tap_type, **{setting: True})
+        target = self._table_format_target()
+        target['type'] = target_type
+
+        with pytest.raises(InvalidConfigException, match=setting):
+            Config.validate_snowflake_decimal_versioning(tap, target)
+
+    @staticmethod
+    def _table_format_tap(**settings):
+        return {
+            'id': 'test_tap',
+            'name': 'Test tap',
+            'type': 'tap-postgres',
+            'db_conn': {},
+            'target': 'test_target',
+            'schemas': [],
+            **settings,
+        }
+
+    @staticmethod
+    def _table_format_target(**connection_settings):
+        return _table_format_target(**connection_settings)
+
+    @staticmethod
+    def _yugabyte_tap(port, replication_method=None, tap_type='tap-yugabyte'):
+        table = {'table_name': 'orders'}
+        if replication_method:
+            table['replication_method'] = replication_method
+        return TestConfig._table_format_tap(
+            type=tap_type,
+            db_conn={'port': port},
+            schemas=[{'source_schema': 'public', 'target_schema': 'public', 'tables': [table]}],
+        )
+
+    @pytest.mark.parametrize(
+        'port, replication_method',
+        [(15436, 'LOG_BASED'), ('15436', 'LOG_BASED'), (5432, 'LOG_BASED'), (15436, None)],
+    )
+    def test_yugabyte_log_based_rejects_ports_the_driver_ignores(self, port, replication_method):
+        """LOG_BASED, explicit or the default, would otherwise fail after FastSync on the driver's 5433."""
+        with pytest.raises(InvalidConfigException) as error:
+            Config.validate_yugabyte_log_based_port(self._yugabyte_tap(port, replication_method))
+
+        message = str(error.value)
+        assert f'public.orders on port {port}' in message
+        assert 'psycopg2-yugabytedb-binary 2.9.3.5 and 2.9.3.5.post1' in message
+
+    @pytest.mark.parametrize(
+        'port, replication_method, tap_type',
+        [
+            (5433, 'LOG_BASED', 'tap-yugabyte'),
+            ('5433', 'LOG_BASED', 'tap-yugabyte'),
+            (15436, 'FULL_TABLE', 'tap-yugabyte'),
+            (15436, 'INCREMENTAL', 'tap-yugabyte'),
+            (15436, 'LOG_BASED', 'tap-postgres'),
+        ],
+    )
+    def test_yugabyte_log_based_port_check_allows_unaffected_configs(self, port, replication_method, tap_type):
+        """Port 5433, explicit non-LOG_BASED tables, and other taps are unaffected."""
+        Config.validate_yugabyte_log_based_port(self._yugabyte_tap(port, replication_method, tap_type))
+
+    @pytest.mark.parametrize('replication_method', ['LOG_BASED', 'FULL_TABLE', 'INCREMENTAL', None])
+    def test_yugabyte_rejects_managed_iceberg_targets(self, replication_method):
+        """No YugabyteDB Iceberg FastSync route exists, so nothing would create the LOG_BASED slot."""
+        tap = self._yugabyte_tap(5433, replication_method)
+        tap.update(target_table_format='iceberg', iceberg_version=3)
+
+        with pytest.raises(InvalidConfigException, match='YugabyteDB does not support managed Iceberg targets'):
+            Config.validate_yugabyte_route(tap, {'id': 'snowflake', 'type': 'target-snowflake'})
+
+    @pytest.mark.parametrize('replication_method', ['LOG_BASED', None])
+    def test_yugabyte_log_based_rejects_targets_without_fastsync(self, replication_method):
+        """LOG_BASED, explicit or the default, needs FastSync to create its replication slot."""
+        with pytest.raises(InvalidConfigException) as error:
+            Config.validate_yugabyte_route(
+                self._yugabyte_tap(5433, replication_method), {'id': 's3', 'type': 'target-s3-csv'},
+            )
+
+        assert 'LOG_BASED replication for public.orders with target "s3" (target-s3-csv)' in str(error.value)
+
+    @pytest.mark.parametrize(
+        'replication_method, target_type, settings, tap_type',
+        [
+            ('LOG_BASED', 'target-snowflake', {}, 'tap-yugabyte'),
+            (None, 'target-snowflake', {'target_table_format': 'native'}, 'tap-yugabyte'),
+            ('LOG_BASED', 'target-postgres', {}, 'tap-yugabyte'),
+            ('FULL_TABLE', 'target-s3-csv', {}, 'tap-yugabyte'),
+            ('INCREMENTAL', 'target-s3-csv', {}, 'tap-yugabyte'),
+            ('LOG_BASED', 'target-snowflake', {'target_table_format': 'iceberg'}, 'tap-postgres'),
+        ],
+    )
+    def test_yugabyte_route_check_allows_supported_configs(self, replication_method, target_type, settings,
+                                                           tap_type):
+        """FastSync routes, Singer-only methods without a slot, and other taps are unaffected."""
+        tap = self._yugabyte_tap(5433, replication_method, tap_type)
+        tap.update(settings)
+        Config.validate_yugabyte_route(tap, {'id': 'target', 'type': target_type})
+
+    def test_from_yamls_rejects_yugabyte_managed_iceberg(self, tmp_path):
+        """validate and import_config both reject the route before any connector runs."""
+        yaml_dir = tmp_path / 'yaml'
+        yaml_dir.mkdir()
+        tap = self._yugabyte_tap(5433, 'FULL_TABLE')
+        tap.update(target_table_format='iceberg', iceberg_version=3, data_flattening_max_level=0)
+        (yaml_dir / 'tap_test.yml').write_text(json.dumps(tap), encoding='utf-8')
+        (yaml_dir / 'target_test.yml').write_text(json.dumps(self._table_format_target()), encoding='utf-8')
+
+        with pytest.raises(InvalidConfigException, match='YugabyteDB does not support managed Iceberg targets'):
+            Config.from_yamls(str(tmp_path / 'runtime'), str(yaml_dir))
+
+    def test_from_yamls_rejects_yugabyte_log_based_on_unsupported_port(self, tmp_path):
+        """validate and import_config both load YAML through from_yamls, so the check runs before FastSync."""
+        yaml_dir = tmp_path / 'yaml'
+        yaml_dir.mkdir()
+        (yaml_dir / 'tap_test.yml').write_text(json.dumps(self._yugabyte_tap(15436, 'LOG_BASED')), encoding='utf-8')
+        (yaml_dir / 'target_test.yml').write_text(json.dumps(self._table_format_target()), encoding='utf-8')
+
+        with pytest.raises(InvalidConfigException, match='LOG_BASED requires port 5433'):
+            Config.from_yamls(str(tmp_path / 'runtime'), str(yaml_dir))
+
+    @pytest.mark.parametrize(
+        'settings',
+        [
+            {},
+            {'target_table_format': 'native'},
+            {'target_table_format': 'iceberg', 'iceberg_version': 3},
+        ],
+    )
+    def test_target_table_format_schema_accepts_supported_settings(self, settings):
+        """The tap schema accepts omission, native, and explicit Iceberg v3."""
+        cli.utils.validate(
+            self._table_format_tap(**settings),
+            cli.utils.load_schema('tap'),
+        )
+
+    @pytest.mark.parametrize(
+        'settings',
+        [
+            {'target_table_format': 'unsupported'},
+            {'target_table_format': 'iceberg'},
+            {'target_table_format': 'native', 'iceberg_version': 3},
+            {'iceberg_version': 3},
+            {'target_table_format': 'iceberg', 'iceberg_version': 2},
+            {'target_table_format': 'iceberg', 'iceberg_version': 4},
+            {'target_table_format': 'iceberg', 'iceberg_version': '3'},
+        ],
+    )
+    def test_target_table_format_schema_rejects_invalid_settings(self, settings):
+        """Iceberg version 3 is valid only with an explicit Iceberg format."""
+        with pytest.raises(InvalidConfigException):
+            cli.utils.validate(
+                self._table_format_tap(**settings),
+                cli.utils.load_schema('tap'),
+            )
+
+    @pytest.mark.parametrize('placement', ['root', 'db_conn'])
+    @pytest.mark.parametrize(
+        ('setting', 'value'),
+        [
+            ('iceberg_create', False),
+            ('target_table_format', 'iceberg'),
+            ('iceberg_version', 3),
+        ],
+    )
+    def test_target_schema_rejects_reserved_table_format_settings(
+        self, placement, setting, value
+    ):
+        """Shared target definitions cannot own per-tap format settings."""
+        target = self._table_format_target()
+        if placement == 'root':
+            target[setting] = value
+        else:
+            target['db_conn'][setting] = value
+
+        with pytest.raises(InvalidConfigException):
+            cli.utils.validate(
+                target,
+                cli.utils.load_schema('target'),
+            )
+
+        # Reserved-key rules must not close the connector-specific db_conn schema.
+        cli.utils.validate(
+            self._table_format_target(connector_specific_option='value'),
+            cli.utils.load_schema('target'),
+        )
+
+    @pytest.mark.parametrize('placement', ['root', 'db_conn'])
+    @pytest.mark.parametrize(
+        ('setting', 'value'),
+        [
+            ('iceberg_create', True),
+            ('iceberg_create', False),
+            ('iceberg_create', 'true'),
+            ('iceberg_create', None),
+            ('target_table_format', 'native'),
+            ('target_table_format', 'iceberg'),
+            ('iceberg_version', 3),
+        ],
+    )
+    def test_target_table_format_placement_rejects_shared_target_settings(
+        self, placement, setting, value
+    ):
+        """Placement policy reports reserved settings at either target level."""
+        target = self._table_format_target()
+        if placement == 'root':
+            target[setting] = value
+        else:
+            target['db_conn'][setting] = value
+
+        with pytest.raises(InvalidConfigException, match=setting):
+            Config.validate_target_table_format_placement(target)
+
+    @pytest.mark.parametrize(
+        'tap_settings',
+        [
+            {},
+            {'target_table_format': 'native'},
+            {'target_table_format': 'iceberg', 'iceberg_version': 3},
+        ],
+    )
+    def test_target_table_format_policy_accepts_tap_level_contract(self, tap_settings):
+        """Omission, native, and explicit v3 are the complete tap contract."""
+        Config.validate_target_table_format(
+            self._table_format_tap(**tap_settings),
+            self._table_format_target(),
+        )
+
+    @pytest.mark.parametrize(
+        ('placement', 'setting', 'value'),
+        [
+            ('root', 'iceberg_create', True),
+            ('root', 'iceberg_create', False),
+            ('root', 'iceberg_create', 'true'),
+            ('root', 'iceberg_create', None),
+            ('db_conn', 'iceberg_create', False),
+            ('db_conn', 'target_table_format', 'iceberg'),
+            ('db_conn', 'iceberg_version', 3),
+        ],
+    )
+    def test_tap_policy_and_schema_reject_reserved_setting_placements(
+        self, placement, setting, value
+    ):
+        """Tap root rejects legacy flags and tap db_conn rejects every format key."""
+        tap = self._table_format_tap()
+        if placement == 'root':
+            tap[setting] = value
+        else:
+            tap['db_conn'][setting] = value
+
+        with pytest.raises(InvalidConfigException, match=setting):
+            Config.validate_tap_table_format_placement(tap)
+        with pytest.raises(InvalidConfigException, match=setting):
+            Config.validate_target_table_format(tap, self._table_format_target())
+        with pytest.raises(InvalidConfigException):
+            cli.utils.validate(
+                tap,
+                cli.utils.load_schema('tap'),
+            )
+
+    def test_target_table_format_policy_rejects_non_snowflake_target(self):
+        """The tap-level destination format is meaningful only for Snowflake."""
+        target = self._table_format_target()
+        target['type'] = 'target-postgres'
+
+        with pytest.raises(InvalidConfigException, match='is not target-snowflake'):
+            Config.validate_target_table_format(
+                self._table_format_tap(target_table_format='native'),
+                target,
+            )
+
+    @pytest.mark.parametrize(
+        ('tap_settings', 'error_message'),
+        [
+            ({'type': 'tap-salesforce'}, None),
+            ({'type': 'tap-mysql', 'hard_delete': False}, None),
+            ({'type': 'tap-salesforce', 'hard_delete': False}, None),
+            (
+                {'type': 'tap-mysql', 'data_flattening_max_level': 1},
+                'data_flattening_max_level: 0',
+            ),
+            (
+                {'type': 'tap-postgres', 'data_flattening_max_level': 1},
+                'data_flattening_max_level: 0',
+            ),
+        ],
+    )
+    def test_explicit_iceberg_route_policy(self, tap_settings, error_message):
+        """Singer is source-agnostic; hard delete is universal and FastSync stays unflattened."""
+        tap = self._table_format_tap(**{
+            'target_table_format': 'iceberg',
+            'iceberg_version': 3,
+            **tap_settings,
+        })
+
+        if error_message:
+            with pytest.raises(InvalidConfigException, match=error_message):
+                Config.validate_target_table_format(tap, self._table_format_target())
+            return
+
+        Config.validate_target_table_format(tap, self._table_format_target())
+        inheritable = Config(PIPELINEWISE_TEST_HOME).generate_inheritable_config(tap)
+        assert inheritable['target_table_format'] == 'iceberg'
+        assert inheritable['iceberg_version'] == 3
+        assert inheritable['data_flattening_max_level'] == (10 if tap['type'] == 'tap-salesforce' else 0)
+        assert 'hard_delete' not in inheritable
+
+    def test_target_table_format_is_isolated_between_taps(self, tmp_path):
+        """Taps sharing one target get independent generated format settings."""
+        config = Config(str(tmp_path))
+        omitted_tap = self._table_format_tap(id='omitted_tap')
+        native_tap = self._table_format_tap(
+            id='native_tap', target_table_format='native'
+        )
+        iceberg_tap = self._table_format_tap(
+            id='iceberg_tap', target_table_format='iceberg', iceberg_version=3
+        )
+        target = self._table_format_target()
+        target['taps'] = [omitted_tap, native_tap, iceberg_tap]
+        config.targets = {target['id']: target}
+
+        config.save()
+
+        target_dir = tmp_path / target['id']
+        native_config = cli.utils.load_json(
+            str(target_dir / native_tap['id'] / 'inheritable_config.json')
+        )
+        iceberg_config = cli.utils.load_json(
+            str(target_dir / iceberg_tap['id'] / 'inheritable_config.json')
+        )
+        main_config = cli.utils.load_json(str(tmp_path / 'config.json'))
+        main_taps = {
+            tap['id']: tap for tap in main_config['targets'][0]['taps']
+        }
+        omitted_config = cli.utils.load_json(
+            str(target_dir / omitted_tap['id'] / 'inheritable_config.json')
+        )
+        target_config = cli.utils.load_json(str(target_dir / 'config.json'))
+
+        assert 'target_table_format' not in omitted_config
+        assert 'iceberg_version' not in omitted_config
+        assert native_config['target_table_format'] == 'native'
+        assert 'iceberg_version' not in native_config
+        assert iceberg_config['target_table_format'] == 'iceberg'
+        assert iceberg_config['iceberg_version'] == 3
+        assert all(runtime['source_tap_type'] == 'tap-postgres'
+                   for runtime in (omitted_config, native_config, iceberg_config))
+        assert 'target_table_format' not in main_taps['omitted_tap']
+        assert 'iceberg_version' not in main_taps['omitted_tap']
+        assert main_taps['native_tap']['target_table_format'] == 'native'
+        assert 'iceberg_version' not in main_taps['native_tap']
+        assert main_taps['iceberg_tap']['target_table_format'] == 'iceberg'
+        assert main_taps['iceberg_tap']['iceberg_version'] == 3
+        assert not Config.TARGET_FORMAT_KEYS.intersection(target_config)
+
+    @pytest.mark.parametrize(
+        ('tap_settings', 'expected_format_settings'),
+        [
+            (
+                {
+                    'type': 'tap-mysql',
+                    'target_table_format': 'iceberg',
+                    'iceberg_version': 3,
+                },
+                {'target_table_format': 'iceberg', 'iceberg_version': 3},
+            ),
+            ({'type': 'tap-mysql'}, {}),
+            ({'type': 'tap-mysql', 'target_table_format': 'native'}, {}),
+            (
+                {
+                    'type': 'tap-postgres',
+                    'target_table_format': 'iceberg',
+                    'iceberg_version': 3,
+                },
+                {},
+            ),
+        ],
+    )
+    def test_only_explicit_mysql_iceberg_settings_reach_tap_connector(
+        self, tap_settings, expected_format_settings
+    ):
+        """Only tap-mysql needs destination format metadata during discovery."""
+        tap = self._table_format_tap(**tap_settings)
+        tap['db_conn'] = {'host': 'mysql.example'}
+
+        generated = Config.generate_tap_connection_config(
+            tap, {'server_id': 123}
+        )
+
+        assert generated == {
+            'host': 'mysql.example',
+            'server_id': 123,
+            **expected_format_settings,
+        }
+
+    def test_from_yamls(self):
+        """Test creating Config object using YAML configuration directory as the input"""
+
+        # Create Config object by parsing target and tap YAMLs in a directory
+        yaml_config_dir = f'{os.path.dirname(__file__)}/resources/test_yaml_config'
+
+        vault_secret = f'{os.path.dirname(__file__)}/resources/vault-secret.txt'
+
+        # Parse YAML files and create the config object
+        config = Config.from_yamls(
+            PIPELINEWISE_TEST_HOME, yaml_config_dir, vault_secret
+        )
+
+        # config dir and path should be generated automatically
+        assert config.config_dir == PIPELINEWISE_TEST_HOME
+        assert config.config_path == f'{PIPELINEWISE_TEST_HOME}/config.json'
+
+        # Vault encrypted alert handlers should be loaded into global config
+        assert config.global_config == {
+            'alert_handlers': {
+                'slack': {
+                    'token': 'Vault Encrypted Secret Fruit',
+                    'channel': '#slack-channel',
+                }
+            }
+        }
+
+        # The target dictionary should contain every target and tap parsed from YAML files
+        assert config.targets == {
+            'test_snowflake_target': {
+                'id': 'test_snowflake_target',
+                'name': 'Test Target Connector',
+                'type': 'target-snowflake',
+                'db_conn': {
+                    'account': 'account',
+                    'aws_access_key_id': 'access_key_id',
+                    'aws_secret_access_key': 'secret_access_key',
+                    'client_side_encryption_master_key': 'master_key',
+                    'dbname': 'foo_db',
+                    'file_format': 'foo_file_format',
+                    'private_key': 'private_key_path',
+                    's3_bucket': 's3_bucket',
+                    's3_key_prefix': 's3_prefix/',
+                    'stage': 'foo_stage',
+                    'user': 'user',
+                    'warehouse': 'MY_WAREHOUSE',
+                },
+                'files': {
+                    'config': f'{PIPELINEWISE_TEST_HOME}/test_snowflake_target/config.json',
+                    'inheritable_config': f'{ PIPELINEWISE_TEST_HOME}/test_snowflake_target/inheritable_config.json',
+                    'properties': f'{PIPELINEWISE_TEST_HOME}/test_snowflake_target/properties.json',
+                    'selection': f'{PIPELINEWISE_TEST_HOME}/test_snowflake_target/selection.json',
+                    'state': f'{PIPELINEWISE_TEST_HOME}/test_snowflake_target/state.json',
+                    'transformation': f'{PIPELINEWISE_TEST_HOME}/test_snowflake_target/transformation.json',
+                    'pidfile': f'{PIPELINEWISE_TEST_HOME}/test_snowflake_target/pipelinewise.pid',
+                },
+                'taps': [
+                    {
+                        'id': 'mysql_sample',
+                        'name': 'Sample MySQL Database',
+                        'type': 'tap-mysql',
+                        'owner': 'somebody@foo.com',
+                        'target': 'test_snowflake_target',
+                        'batch_size_rows': 20000,
+                        'batch_wait_limit_seconds': 3600,
+                        'split_large_files': True,
+                        'split_file_chunk_size_mb': 500,
+                        'split_file_max_chunks': 25,
+                        'db_conn': {
+                            'dbname': '<DB_NAME>',
+                            'host': '<HOST>',
+                            'password': '<PASSWORD>',
+                            'port': 3306,
+                            'user': '<USER>',
+                        },
+                        'files': {
+                            'config': f'{PIPELINEWISE_TEST_HOME}/test_snowflake_target/mysql_sample/config.json',
+                            'inheritable_config': f'{PIPELINEWISE_TEST_HOME}'
+                                                  f'/test_snowflake_target/mysql_sample/inheritable_config.json',
+                            'properties': f'{PIPELINEWISE_TEST_HOME}/'
+                                          f'test_snowflake_target/mysql_sample/properties.json',
+                            'selection': f'{PIPELINEWISE_TEST_HOME}/test_snowflake_target/mysql_sample/selection.json',
+                            'state': f'{PIPELINEWISE_TEST_HOME}/test_snowflake_target/mysql_sample/state.json',
+                            'transformation': f'{PIPELINEWISE_TEST_HOME}'
+                                              f'/test_snowflake_target/mysql_sample/transformation.json',
+                            'pidfile': f'{PIPELINEWISE_TEST_HOME}/test_snowflake_target/mysql_sample/pipelinewise.pid',
+                        },
+                        'schemas': [
+                            {
+                                'source_schema': 'my_db',
+                                'target_schema': 'repl_my_db',
+                                'target_schema_select_permissions': ['grp_stats'],
+                                'tables': [
+                                    {
+                                        'table_name': 'table_one',
+                                        'replication_method': 'INCREMENTAL',
+                                        'replication_key': 'last_update',
+                                    },
+                                    {
+                                        'table_name': 'table_two',
+                                        'replication_method': 'LOG_BASED',
+                                    },
+                                ],
+                            }
+                        ],
+                    }
+                ],
+            }
+        }
+
+    def test_from_invalid_mongodb_yamls(self):
+        """Test creating Config object using invalid YAML configuration directory"""
+
+        # Initialising config object with a tap that's referencing an unknown target should exit
+        yaml_config_dir = '{}/resources/test_invalid_tap_mongo_yaml_config'.format(
+            os.path.dirname(__file__)
+        )
+        vault_secret = '{}/resources/vault-secret.txt'.format(os.path.dirname(__file__))
+        print(yaml_config_dir)
+        with pytest.raises(InvalidConfigException):
+            Config.from_yamls(PIPELINEWISE_TEST_HOME, yaml_config_dir, vault_secret)
+
+    def test_from_invalid_yamls(self):
+        """Test creating Config object using invalid YAML configuration directory"""
+
+        # TODO: Make behaviours consistent.
+        #   In some cases it raise exception in some other cases it does exit
+
+        # Initialising Config object with a not existing directory should raise an exception
+        with pytest.raises(Exception):
+            Config.from_yamls(
+                PIPELINEWISE_TEST_HOME, 'not-existing-yaml-config-directory'
+            )
+
+        # Initialising config object with a tap that's referencing an unknown target should exit
+        yaml_config_dir = '{}/resources/test_invalid_yaml_config'.format(
+            os.path.dirname(__file__)
+        )
+        vault_secret = '{}/resources/vault-secret.txt'.format(os.path.dirname(__file__))
+
+        with pytest.raises(SystemExit) as pytest_wrapped_e:
+            Config.from_yamls(PIPELINEWISE_TEST_HOME, yaml_config_dir, vault_secret)
+        assert pytest_wrapped_e.type is SystemExit
+        assert pytest_wrapped_e.value.code == 1
+
+    def test_from_invalid_yamls_fails(self):
+        """
+        Test creating Config object using invalid YAML configuration
+        directory should fail due to duplicate targets
+        """
+
+        # TODO: Make behaviours consistent.
+        #   In some cases it raise exception in some other cases it does exit
+
+        # Initialising Config object with a not existing directory should raise an exception
+        with pytest.raises(Exception):
+            Config.from_yamls(
+                PIPELINEWISE_TEST_HOME, 'not-existing-yaml-config-directory'
+            )
+
+        # Initialising config object with a tap that's referencing an unknown target should exit
+        yaml_config_dir = f'{os.path.dirname(__file__)}/resources/test_invalid_yaml_config_with_duplicate_targets'
+        vault_secret = f'{os.path.dirname(__file__)}/resources/vault-secret.txt'
+
+        with pytest.raises(SystemExit) as pytest_wrapped_e:
+            Config.from_yamls(PIPELINEWISE_TEST_HOME, yaml_config_dir, vault_secret)
+        assert pytest_wrapped_e.type is SystemExit
+        assert pytest_wrapped_e.value.code == 1
+
+    def test_getters(self):
+        """Test Config getter functions"""
+        config = Config(PIPELINEWISE_TEST_HOME)
+
+        # Target and tap directory should be g
+        assert config.get_temp_dir() == '{}/tmp'.format(PIPELINEWISE_TEST_HOME)
+        assert config.get_target_dir('test-target-id') == '{}/test-target-id'.format(
+            PIPELINEWISE_TEST_HOME
+        )
+        assert config.get_tap_dir(
+            'test-target-id', 'test-tap-id'
+        ) == '{}/test-target-id/test-tap-id'.format(PIPELINEWISE_TEST_HOME)
+
+        assert config.get_connector_files('/var/singer-connector') == {
+            'config': '/var/singer-connector/config.json',
+            'inheritable_config': '/var/singer-connector/inheritable_config.json',
+            'properties': '/var/singer-connector/properties.json',
+            'state': '/var/singer-connector/state.json',
+            'transformation': '/var/singer-connector/transformation.json',
+            'selection': '/var/singer-connector/selection.json',
+            'pidfile': '/var/singer-connector/pipelinewise.pid',
+        }
+
+    def test_save_config(self):
+        """Test config target and tap JSON save functionalities"""
+
+        json_config_dir = './pipelinewise-test-config'
+
+        config = self._get_config(json_config_dir, yaml_path='test_yaml_config')
+        # Save the config as singer compatible JSON files
+        config.save()
+
+        json_files = self._get_json_files_path('mysql_sample', json_config_dir)
+
+        # Check content of the generated JSON files
+        assert cli.utils.load_json(json_files['main_config_json']) == {
+            'alert_handlers': {
+                'slack': {
+                    'token': 'Vault Encrypted Secret Fruit',
+                    'channel': '#slack-channel',
+                }
+            },
+            'targets': [
+                {
+                    'id': 'test_snowflake_target',
+                    'type': 'target-snowflake',
+                    'name': 'Test Target Connector',
+                    'status': 'ready',
+                    'taps': [
+                        {
+                            'id': 'mysql_sample',
+                            'type': 'tap-mysql',
+                            'name': 'Sample MySQL Database',
+                            'owner': 'somebody@foo.com',
+                            'stream_buffer_size': None,
+                            'send_alert': True,
+                            'enabled': True,
+                        }
+                    ],
+                }
+            ],
+        }
+        assert cli.utils.load_json(json_files['target_config_json']) == {
+            'account': 'account',
+            'aws_access_key_id': 'access_key_id',
+            'aws_secret_access_key': 'secret_access_key',
+            'client_side_encryption_master_key': 'master_key',
+            'dbname': 'foo_db',
+            'file_format': 'foo_file_format',
+            'private_key': 'private_key_path',
+            's3_bucket': 's3_bucket',
+            's3_key_prefix': 's3_prefix/',
+            'stage': 'foo_stage',
+            'user': 'user',
+            'warehouse': 'MY_WAREHOUSE',
+        }
+        assert cli.utils.load_json(json_files['tap_config_json']) == {
+            'decimal_target': 'snowflake',
+            'dbname': '<DB_NAME>',
+            'host': '<HOST>',
+            'port': 3306,
+            'user': '<USER>',
+            'password': '<PASSWORD>',
+            'server_id': cli.utils.load_json(json_files['tap_config_json'])['server_id'],
+        }
+        assert cli.utils.load_json(json_files['tap_selection_json']) == {
+            'selection': [
+                {
+                    'replication_key': 'last_update',
+                    'replication_method': 'INCREMENTAL',
+                    'tap_stream_id': 'my_db-table_one',
+                },
+                {'replication_method': 'LOG_BASED', 'tap_stream_id': 'my_db-table_two'},
+            ]
+        }
+        assert cli.utils.load_json(json_files['tap_transformation_json']) == {'transformations': []}
+        assert cli.utils.load_json(json_files['tap_inheritable_config_json']) == {
+            'batch_size_rows': 20000,
+            'batch_wait_limit_seconds': 3600,
+            'data_flattening_max_level': 0,
+            'flush_all_streams': True,
+            'parallelism': 0,
+            'parallelism_max': 4,
+            'primary_key_required': True,
+            'schema_mapping': {
+                'my_db': {
+                    'target_schema': 'repl_my_db',
+                    'target_schema_select_permissions': ['grp_stats'],
+                }
+            },
+            'temp_dir': './pipelinewise-test-config/tmp',
+            'tap_id': 'mysql_sample',
+            'source_tap_type': 'tap-mysql',
+            'query_tag': '{"ppw_component": "tap-mysql", "tap_id": "mysql_sample", '
+            '"database": "{{database}}", "schema": "{{schema}}", "table": "{{table}}"}',
+            'validate_records': False,
+            'add_metadata_columns': False,
+            'split_large_files': True,
+            'split_file_chunk_size_mb': 500,
+            'split_file_max_chunks': 25,
+            'archive_load_files': False,
+            'version_legacy_float_columns': False,
+        }
+
+        # Delete the generated JSON config directory
+        shutil.rmtree(json_config_dir)
+
+    def test_save_config_selected_tap(self):
+        """Test config target and tap JSON save functionalities if specific taps are selected"""
+        json_config_dir = './pipelinewise-test-config'
+        config = self._get_config(json_config_dir, yaml_path='test_import_command')
+        json_files = self._get_json_files_path('tap_two', json_config_dir)
+
+        # Save the config as singer compatible JSON files
+        config.save(['tap_two'])
+
+        # Check content of the generated JSON files
+        generated_json_content = cli.utils.load_json(json_files['main_config_json'])
+
+        generated_targets = generated_json_content.get('targets')
+        generated_targets_taps = generated_targets[0].pop('taps')
+
+        assert generated_json_content.get('targets') == [
+            {
+                'id': 'test_snowflake_target',
+                'type': 'target-snowflake',
+                'name': 'Test Target Connector',
+                'status': 'ready'
+            }
+        ]
+
+        expected_generated_taps = [
+            {
+                'id': 'tap_one',
+                'type': 'tap-mysql',
+                'name': 'Sample MySQL Database',
+                'owner': 'somebody@foo.com',
+                'stream_buffer_size': None,
+                'send_alert': True,
+                'enabled': True,
+            },
+            {
+                'id': 'tap_two',
+                'type': 'tap-mysql',
+                'name': 'Sample MySQL Database',
+                'owner': 'somebody@foo.com',
+                'stream_buffer_size': None,
+                'send_alert': True,
+                'enabled': True,
+            },
+            {
+                'id': 'tap_three',
+                'type': 'tap-mysql',
+                'name': 'Sample MySQL Database',
+                'owner': 'somebody@foo.com',
+                'stream_buffer_size': None,
+                'send_alert': True,
+                'enabled': True,
+            }
+        ]
+        assert len(generated_targets_taps) == len(expected_generated_taps)
+        for tap in expected_generated_taps:
+            assert tap in generated_targets_taps
+
+        assert cli.utils.load_json(json_files['target_config_json']) == {
+            'account': 'account',
+            'aws_access_key_id': 'access_key_id',
+            'aws_secret_access_key': 'secret_access_key',
+            'client_side_encryption_master_key': 'master_key',
+            'dbname': 'foo_db',
+            'file_format': 'foo_file_format',
+            'password': 'secret',
+            's3_bucket': 's3_bucket',
+            's3_key_prefix': 's3_prefix/',
+            'stage': 'foo_stage',
+            'user': 'user',
+            'warehouse': 'MY_WAREHOUSE',
+        }
+        assert cli.utils.load_json(json_files['tap_config_json']) == {
+            'decimal_target': 'snowflake',
+            'dbname': '<DB_NAME>',
+            'host': '<HOST>',
+            'port': 3306,
+            'user': '<USER>',
+            'password': '<PASSWORD>',
+            'server_id': cli.utils.load_json(json_files['tap_config_json'])['server_id'],
+        }
+        assert cli.utils.load_json(json_files['tap_selection_json']) == {
+            'selection': [
+                {
+                    'replication_key': 'last_update',
+                    'replication_method': 'INCREMENTAL',
+                    'tap_stream_id': 'my_db-table_one',
+                },
+                {'replication_method': 'LOG_BASED', 'tap_stream_id': 'my_db-table_two'},
+            ]
+        }
+        assert cli.utils.load_json(json_files['tap_transformation_json']) == {'transformations': []}
+        assert cli.utils.load_json(json_files['tap_inheritable_config_json']) == {
+            'batch_size_rows': 20000,
+            'batch_wait_limit_seconds': 3600,
+            'data_flattening_max_level': 0,
+            'flush_all_streams': True,
+            'parallelism': 0,
+            'parallelism_max': 4,
+            'primary_key_required': True,
+            'schema_mapping': {
+                'my_db': {
+                    'target_schema': 'repl_my_db',
+                    'target_schema_select_permissions': ['grp_stats'],
+                }
+            },
+            'temp_dir': './pipelinewise-test-config/tmp',
+            'tap_id': 'tap_two',
+            'source_tap_type': 'tap-mysql',
+            'query_tag': '{"ppw_component": "tap-mysql", "tap_id": "tap_two", '
+            '"database": "{{database}}", "schema": "{{schema}}", "table": "{{table}}"}',
+            'validate_records': False,
+            'add_metadata_columns': False,
+            'split_large_files': True,
+            'split_file_chunk_size_mb': 500,
+            'split_file_max_chunks': 25,
+            'archive_load_files': False,
+            'version_legacy_float_columns': False,
+        }
+
+        tap_one_existence = os.path.exists(f'{json_config_dir}/test_snowflake_target/tap_one')
+
+        # Delete the generated JSON config directory
+        shutil.rmtree(json_config_dir)
+
+        # Assert only tap_two is created
+        assert tap_one_existence is False
+
+    def test_save_config_with_optional_slack_channel_for_alerts(self):
+        """Test config target and tap JSON save functionalities if there is a optional setting for slack channel"""
+
+        # Load a full configuration set from YAML files
+        yaml_config_dir = '{}/resources/test_yaml_config_with_slack_channel'.format(
+            os.path.dirname(__file__)
+        )
+        vault_secret = '{}/resources/vault-secret.txt'.format(os.path.dirname(__file__))
+
+        json_config_dir = './pipelinewise-test-config'
+        config = Config.from_yamls(json_config_dir, yaml_config_dir, vault_secret)
+
+        # Save the config as singer compatible JSON files
+        config.save()
+
+        # Check if every required JSON file created, both for target and tap
+        main_config_json = '{}/config.json'.format(json_config_dir)
+
+        # Check content of the generated JSON files
+        actual_config_json = cli.utils.load_json(main_config_json)
+
+        expected_taps_config = [
+            {
+                'id': 'mysql_sample_1',
+                'type': 'tap-mysql',
+                'name': 'Sample MySQL Database',
+                'owner': 'somebody@foo.com',
+                'stream_buffer_size': None,
+                'send_alert': True,
+                'enabled': True,
+                'slack_alert_channel': '#test-channel_1'
+            },
+            {
+                'id': 'mysql_sample_2',
+                'type': 'tap-mysql',
+                'name': 'Sample MySQL Database',
+                'owner': 'somebody@foo.com',
+                'stream_buffer_size': None,
+                'send_alert': True,
+                'enabled': True,
+                'slack_alert_channel': '#test-channel_2'
+            },
+            {
+                'id': 'mysql_sample_3',
+                'type': 'tap-mysql',
+                'name': 'Sample MySQL Database',
+                'owner': 'somebody@foo.com',
+                'stream_buffer_size': None,
+                'send_alert': True,
+                'enabled': True,
+            }
+        ]
+
+        assert len(actual_config_json['targets'][0]['taps']) == 3
+
+        for tap_config in expected_taps_config:
+            assert tap_config in actual_config_json['targets'][0]['taps']
+
+        # Delete the generated JSON config directory
+        shutil.rmtree(json_config_dir)
+
+
+@pytest.mark.parametrize('role', [None, '', True, 42])
+def test_snowflake_role_rejects_invalid(role):
+    """A configured Snowflake role must be a non-empty string."""
+    with pytest.raises(InvalidConfigException):
+        cli.utils.validate(
+            _table_format_target(role=role),
+            cli.utils.load_schema('target'),
+        )
+
+
+def test_snowflake_role_accepts_string():
+    """A non-empty Snowflake role remains valid for Singer and FastSync."""
+    cli.utils.validate(
+        _table_format_target(role='PIPELINEWISE_LOADER'),
+        cli.utils.load_schema('target'),
+    )
+
+
+def test_target_accepts_history_budget():
+    """Snowflake targets accept a positive integer recovery timeout."""
+    target = _table_format_target(
+        iceberg_query_history_poll_timeout_seconds=3600
+    )
+    Config.validate_snowflake_query_history_poll_timeout(target)
+    cli.utils.validate(target, cli.utils.load_schema('target'))
+
+
+@pytest.mark.parametrize('value', (False, 0, -1, 900.0, '900'))
+def test_target_rejects_bad_history_budget(value):
+    """The recovery timeout is an exact positive integer."""
+    with pytest.raises(InvalidConfigException):
+        Config.validate_snowflake_query_history_poll_timeout(
+            _table_format_target(
+                iceberg_query_history_poll_timeout_seconds=value,
+            )
+        )
+
+
+def test_wrong_target_rejects_history_budget():
+    """The recovery budget belongs only to target-snowflake."""
+    target = _table_format_target(
+        iceberg_query_history_poll_timeout_seconds=900
+    )
+    target['type'] = 'target-postgres'
+
+    with pytest.raises(InvalidConfigException, match='target-snowflake'):
+        Config.validate_snowflake_query_history_poll_timeout(target)
+
+
+def test_import_preserves_history_budget(tmp_path):
+    """Target import retains the validated FastSync recovery setting."""
+    yaml_dir = tmp_path / 'yaml'
+    yaml_dir.mkdir()
+    (yaml_dir / 'target_snowflake.yml').write_text(
+        '\n'.join((
+            'id: test_target',
+            'name: Test target',
+            'type: target-snowflake',
+            'db_conn:',
+            '  account: account',
+            '  dbname: database',
+            '  user: user',
+            '  private_key: private-key',
+            '  warehouse: warehouse',
+            '  s3_bucket: bucket',
+            '  s3_key_prefix: prefix/',
+            '  stage: schema.stage',
+            '  file_format: schema.file_format',
+            '  iceberg_query_history_poll_timeout_seconds: 3600',
+        )),
+        encoding='utf-8',
+    )
+
+    config = Config.from_yamls(
+        str(tmp_path / 'generated'),
+        str(yaml_dir),
+    )
+
+    assert (
+        config.targets['test_target']['db_conn'][
+            'iceberg_query_history_poll_timeout_seconds'
+        ]
+        == 3600
+    )
+
+
+@pytest.mark.parametrize('placement', ('target_root', 'tap_root', 'tap_db_conn'))
+def test_import_rejects_misplaced_budget(tmp_path, placement):
+    """Import rejects every placement outside target-snowflake db_conn."""
+    setting = 'iceberg_query_history_poll_timeout_seconds: 900'
+    yaml_dir = tmp_path / 'yaml'
+    yaml_dir.mkdir()
+    target_lines = [
+        'id: test_target',
+        'name: Test target',
+        'type: target-snowflake',
+    ]
+    if placement == 'target_root':
+        target_lines.append(setting)
+    target_lines.extend((
+        'db_conn:',
+        '  account: account',
+        '  dbname: database',
+        '  user: user',
+        '  private_key: private-key',
+        '  warehouse: warehouse',
+        '  s3_bucket: bucket',
+        '  s3_key_prefix: prefix/',
+        '  stage: schema.stage',
+        '  file_format: schema.file_format',
+    ))
+    (yaml_dir / 'target_snowflake.yml').write_text(
+        '\n'.join(target_lines),
+        encoding='utf-8',
+    )
+    if placement != 'target_root':
+        tap_lines = [
+            'id: test_tap',
+            'name: Test tap',
+            'type: tap-postgres',
+            'target: test_target',
+        ]
+        if placement == 'tap_root':
+            tap_lines.append(setting)
+        tap_lines.append('db_conn:')
+        if placement == 'tap_db_conn':
+            tap_lines.append(f'  {setting}')
+        (yaml_dir / 'tap_postgres.yml').write_text(
+            '\n'.join(tap_lines),
+            encoding='utf-8',
+        )
+
+    with pytest.raises(
+        InvalidConfigException,
+        match='target-snowflake db_conn',
+    ):
+        Config.from_yamls(
+            str(tmp_path / 'generated'),
+            str(yaml_dir),
+        )

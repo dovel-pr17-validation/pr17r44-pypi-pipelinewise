@@ -1,0 +1,75 @@
+# Documentation Instructions
+
+Read root `AGENTS.md` and the guide for the documented behavior.
+
+## Build and sources
+
+`docs/Makefile` sets `SPHINXOPTS = -W`, so warnings fail. The root test extra
+omits Sphinx; the ready container needs the editable package, `sphinx`,
+`sphinx-rtd-theme`, and `sphinxcontrib-mermaid`. Never validate with
+`scripts/publish_docs.sh`, which mutates Git.
+
+After changing RST, Sphinx config, or assets:
+
+```bash
+cd docs && make check
+```
+
+``make check`` validates embedded YAML plus implementation-backed CLI, config,
+and packaged-connector references before a strict clean HTML build. Use
+``make clean html`` only to isolate Sphinx failures.
+
+Verify prose against implementation, CLI help, schemas, examples and runtime;
+do not infer behaviour from the diff alone. Use the root command names and
+FastSync terminology. Root guidance-only/shared-session restrictions apply:
+do not run a project build merely to review or rearrange AGENTS files.
+
+## Content
+
+- Follow the root writing rules. Use familiar words, active verbs, and one idea
+  per sentence. Split long sentences instead of adding clauses or semicolons.
+- Answer what happens, when, and what the operator should do. Keep paragraphs
+  short. Use a brief example for tricky window or retry behaviour.
+- Explain each rule in one place and link to it from CLI/config references.
+  Repeat only for standalone use or safety. Keep implementation detail only
+  when it helps diagnosis, compatibility, or recovery.
+- Order: support, defaults, operational impact, failures, diagnosis, recovery.
+  Separate defaults from examples and supported behaviour from future plans.
+- Exclude Wise-only hosts, credentials, and internal runbooks.
+- Important settings belong in the parameter reference, owning guide and main
+  copy-and-paste example. Check the rendered HTML for each, not only keyword
+  presence in RST. Run the strict docs build when validation is in scope and
+  isolated; otherwise report it as unverified.
+
+## RST
+
+- Preserve heading levels. New pages use `=`, `-`, `'`, then `"` unless their
+  section differs.
+- Put `.. _label:` directly before its heading; link with ``:ref:`label` ``.
+- Declare every code-block language and use Sphinx admonitions.
+- Add pages to the owning toctree, including nested connector indexes; strict
+  builds reject orphans.
+
+## Update map
+
+| Change | Required docs |
+| --- | --- |
+| CLI add/remove/rename | `user_guide/cli.rst`: arguments, environment, references, examples, mentions |
+| Connector add/remove | Connector page, galleries, `project/licenses.rst`, `installation_guide/installation.rst` |
+| Connector behavior/capability/limit | Connector page; concept page if cross-cutting |
+| YAML parameters | `user_guide/yaml_config.rst` reference and main examples; owning connector/behaviour guide |
+| Singer replication | `concept/replication_methods.rst`; `concept/singer.rst` if relevant |
+| FastSync components/selection/pairs | `concept/fastsync.rst`; never list FastSync as a replication method |
+| Resync/`sync_start_from` | `concept/fastsync.rst`, `user_guide/resync.rst` |
+| Data-diff checks/config/coverage/remediation | `user_guide/data_diff.rst` |
+| Data-diff backend config/schema/reporting | `user_guide/data_diff_backend.rst` |
+| PartialSync edge cases | `user_guide/partial_sync.rst`, including visuals |
+| Alert handlers | `user_guide/alerts.rst` |
+| Operational diagnostics | `user_guide/troubleshooting.rst` |
+
+Backend changes also need migration/ERD updates per `pipelinewise/AGENTS.md`.
+Keep AGENTS concise: shared rules in root, scoped invariants with their owner,
+procedures/recipes in linked runbooks. Update guidance for durable architecture,
+CI or workflow changes, not incident history or snapshot test totals. Preserve
+exact limits, commands, exceptions and safety rules when moving content; keep
+ordinary docs edits task-scoped.

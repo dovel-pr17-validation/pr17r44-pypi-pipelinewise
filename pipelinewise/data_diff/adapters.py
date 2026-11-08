@@ -1,0 +1,728 @@
+"""Database adapters for data-diff checks.
+
+One adapter per database type, providing dialect-specific SQL generation, column
+and index metadata, and checksum normalization. Checksum expressions
+must agree numerically across every dialect, since a source and target are compared
+by their sums: see ``checksum_integer`` and ``normalize_checksum_value``.
+"""
+
+import re
+
+from dataclasses import dataclass
+from datetime import date, datetime, time, timezone
+from decimal import Decimal
+from time import perf_counter
+
+import psycopg2.extras
+from singer.snowflake_errors import sanitize_snowflake_errors
+
+
+# Distinguishes "probed, no visibility column" from "not probed yet"; None is a real
+# result here, so it cannot double as the sentinel.
+_UNPROBED = object()
+SCHEMA_CHECK = "schema_compatibility"
+CHECKSUM_CHECK = "row_checksum"
+CHECKSUM_HEX_DIGITS = 12
+CHECKSUM_MASK = (2 ** (CHECKSUM_HEX_DIGITS * 4)) - 1
+CHECKSUM_OFFSET = CHECKSUM_MASK // 2
+METRIC_EXPRESSIONS = {
+    "row_count": "COUNT(*)",
+    "distinct_key_count": "COUNT(DISTINCT {key})",
+    "null_key_count": "COUNT(*) - COUNT({key})",
+    "duplicate_key_count": "COUNT({key}) - COUNT(DISTINCT {key})",
+    "min_key": "MIN({key})",
+    "max_key": "MAX({key})",
+}
+TIMESTAMP_TYPES = (
+    "timestamp with time zone",
+    "timestamp without time zone",
+    "timestamp",
+    "datetime",
+    "timestamp_ltz",
+    "timestamp_ntz",
+    "timestamp_tz",
+)
+# YugabyteDB adds this pg_index.indoption bit to a hash-sharded key column.
+YB_INDOPTION_HASH = 4
+YB_BUCKET_EXPRESSION = re.compile(r"^\(yb_hash_code\((?P<columns>[^()]*)\) % (?P<modulus>[1-9]\d*)\)$")
+
+
+class DataDiffExecutionError(RuntimeError):
+    """Raised for unsafe plans, missing metadata, or execution failures."""
+
+
+@dataclass
+class MetricQueryResult:
+    """Canonical metric values and the duration of their shared query."""
+
+    values: dict
+    duration_seconds: float
+
+
+def _quote(identifier: str, quote_character: str) -> str:
+    if not identifier or "\x00" in identifier:
+        raise DataDiffExecutionError("Database identifiers must be non-empty and cannot contain NUL")
+    return f"{quote_character}{identifier.replace(quote_character, quote_character * 2)}{quote_character}"
+
+
+def _canonical_number(value) -> str:
+    number = Decimal(str(value))
+    if number == number.to_integral():
+        return str(number.quantize(Decimal(1)))
+    return format(number.normalize(), "f")
+
+
+def _as_utc(value: datetime) -> datetime:
+    """Read a naive driver timestamp as UTC and convert an aware one to UTC."""
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def canonical_value(value):
+    """Convert driver-specific values into stable JSON comparison values."""
+    if value is None or isinstance(value, (str, bool)):
+        return value
+    if isinstance(value, (Decimal, float, int)):
+        return _canonical_number(value)
+    if isinstance(value, datetime):
+        return _as_utc(value).isoformat().replace("+00:00", "Z")
+    if isinstance(value, (date, time)):
+        return value.isoformat()
+    if isinstance(value, bytes):
+        return value.hex()
+    return str(value)
+
+
+def _utc_boundary(value: datetime, data_type: str):
+    value = value.astimezone(timezone.utc)
+    normalized_type = data_type.lower()
+    naive_types = ("timestamp without time zone", "datetime", "timestamp_ntz")
+    if any(data_type_name in normalized_type for data_type_name in naive_types):
+        return value.replace(tzinfo=None)
+    return value
+
+
+def _validate_timestamp_type(column: dict, qualified_name: str):
+    data_type = column["data_type"].lower()
+    if not any(data_type.startswith(supported) for supported in TIMESTAMP_TYPES):
+        raise DataDiffExecutionError(
+            f"Data-diff timestamp column {qualified_name} has unsupported type "
+            f"'{column['data_type']}'"
+        )
+
+
+class DatabaseAdapter:
+    """Common SQL and result behavior for one check-side connection."""
+
+    quote_character = '"'
+
+    def __init__(self, connection, statement_timeout_seconds: int):
+        self.connection = connection
+        self.statement_timeout_seconds = statement_timeout_seconds
+
+    def close(self):
+        """Close the physical database connection."""
+        self.connection.close()
+
+    def quote(self, identifier):
+        """Quote one identifier according to this database dialect."""
+        return _quote(identifier, self.quote_character)
+
+    def qualified_table(self, schema, table):
+        """Return a quoted two-part table name."""
+        return f"{self.quote(schema)}.{self.quote(table)}"
+
+    def resolve_columns(
+        self,
+        schema: str,
+        table: str,
+        requested: list,
+        *,
+        allow_missing: bool = False,
+    ) -> dict:
+        """Resolve requested columns to exact names and data types."""
+        raise NotImplementedError
+
+    def normalize_checksum_value(self, column: dict) -> str:
+        """Return a stable textual representation for one checksum column."""
+        name = self.quote(column["name"])
+        kind = column["checksum_kind"]
+        if kind == "string":
+            return f"CAST({name} AS TEXT)"
+        if kind == "exact_numeric":
+            factor = 10 ** column["checksum_scale"]
+            return f"CAST(ROUND({name} * {factor}, 0) AS DECIMAL(38, 0))::TEXT"
+        if kind == "boolean":
+            # The ELSE branch must not swallow NULL, or a NULL source column hashes
+            # identically to a FALSE target one and the mismatch is invisible.
+            return f"CASE WHEN {name} IS NULL THEN NULL WHEN {name} THEN '1' ELSE '0' END"
+        if kind == "timestamp":
+            return f"TO_CHAR({name}, 'YYYY-MM-DD HH24:MI:SS.US')"
+        if kind == "time":
+            return f"TO_CHAR({name}, 'HH24:MI:SS.US')"
+        if kind == "binary":
+            return f"ENCODE({name}, 'hex')"
+        raise DataDiffExecutionError(f"Unsupported checksum kind: {kind}")
+
+    def checksum_integer(self, payload: str) -> str:
+        """Convert the low 48 bits of an MD5 value to a centred integer."""
+        return (
+            f"(('x' || SUBSTRING(MD5({payload}), 21))::bit(48)::bigint "
+            f"- {CHECKSUM_OFFSET})"
+        )
+
+    def checksum_expression(self, columns: list) -> str:
+        """Return a bounded aggregate checksum over ordered row values."""
+        field_hashes = []
+        for column in columns:
+            normalized = self.normalize_checksum_value(column)
+            field_hashes.append(
+                f"CASE WHEN {normalized} IS NULL THEN MD5('N') "
+                f"ELSE MD5(CONCAT('V', {normalized})) END"
+            )
+        row_payload = f"CONCAT({', '.join(field_hashes)})"
+        return f"SUM({self.checksum_integer(row_payload)})"
+
+    def indexes(self, schema: str, table: str) -> list:
+        """Return ordered index-column metadata for the table."""
+        raise NotImplementedError
+
+    def window_predicates(self, schema: str, table: str, timestamp_column: str) -> list:
+        """Return result-neutral source predicates that let a window scan use an index."""
+        return []
+
+    def count_rows_up_to(self, schema: str, table: str, limit: int) -> int:
+        """Count source-visible rows up to a limit under the connection timeout.
+
+        Count the same table, including inherited or partitioned rows, that the
+        comparison reads. NULL timestamps still contribute to the table size.
+        """
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+            raise DataDiffExecutionError('The preflight row limit must be a positive integer')
+        with self.connection.cursor() as cursor:
+            cursor.execute(
+                f'SELECT COUNT(*) AS table_rows FROM '
+                f'(SELECT 1 FROM {self.qualified_table(schema, table)} LIMIT %s) AS ppw_preflight_rows',
+                (limit,),
+            )
+            row = cursor.fetchone()
+        count = row.get('table_rows') if isinstance(row, dict) else (row[0] if row else None)
+        if isinstance(count, bool) or not isinstance(count, int) or not 0 <= count <= limit:
+            raise DataDiffExecutionError('The bounded preflight row count is not a valid integer')
+        return count
+
+    def minimum_timestamp(self, schema: str, table: str, column: dict, cutoff: datetime):
+        """Read the earliest non-NULL timestamp before the settled cutoff in UTC."""
+        timestamp = self.quote(column["name"])
+        predicates = [f"{timestamp} < %s", *self.window_predicates(schema, table, column["name"])]
+        with self.connection.cursor() as cursor:
+            cursor.execute(
+                f"SELECT MIN({timestamp}) FROM {self.qualified_table(schema, table)} "
+                f"WHERE {' AND '.join(predicates)}",
+                (_utc_boundary(cutoff, column["data_type"]),),
+            )
+            row = cursor.fetchone()
+        value = next(iter(row.values())) if isinstance(row, dict) else row[0]
+        if value is None:
+            return None
+        if not isinstance(value, datetime):
+            raise DataDiffExecutionError("The minimum comparison timestamp is not a valid datetime")
+        return _as_utc(value)
+
+    def execute_metrics(self, sql: str, params: tuple, checks: tuple) -> MetricQueryResult:
+        """Execute one aggregate query and canonicalize its values."""
+        started = perf_counter()
+        with self.connection.cursor() as cursor:
+            cursor.execute(sql, params)
+            row = cursor.fetchone()
+            if row is None:
+                raise DataDiffExecutionError("Aggregate query returned no row")
+            if not isinstance(row, dict):
+                row = dict(zip((description[0] for description in cursor.description), row))
+        values_by_name = {str(key).lower(): value for key, value in row.items()}
+        return MetricQueryResult(
+            values={check: canonical_value(values_by_name[check]) for check in checks},
+            duration_seconds=perf_counter() - started,
+        )
+
+
+class PostgresAdapter(DatabaseAdapter):
+    """PostgreSQL metadata, plan, and aggregate operations."""
+
+    def resolve_columns(self, schema, table, requested, *, allow_missing=False):
+        with self.connection.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cursor:
+            cursor.execute(
+                """
+                SELECT column_name, data_type, udt_name, numeric_precision,
+                       numeric_scale, datetime_precision,
+                       character_maximum_length, is_nullable
+                  FROM information_schema.columns
+                 WHERE table_schema = %s AND table_name = %s
+                """,
+                (schema, table),
+            )
+            available = cursor.fetchall()
+        return _match_columns(
+            schema, table, requested, available, allow_missing=allow_missing
+        )
+
+    def indexes(self, schema, table):
+        """Return index metadata, marking which indexes can serve a window scan.
+
+        ``is_usable`` is what the preflight may rely on. An index is unusable when
+        it is partial (``indpred``), built on expressions rather than plain columns
+        (``indexprs``), still building or invalid (``indisready`` / ``indisvalid``),
+        or uses an access method that cannot answer a range predicate — a hash
+        index supports equality only, and BRIN gives block ranges, not ordering.
+        Unusable indexes are still returned so the preflight evidence records them.
+        """
+        with self.connection.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cursor:
+            cursor.execute(
+                """
+                SELECT index_class.relname AS index_name,
+                       array_agg(attribute.attname ORDER BY key_part.ordinality) AS columns,
+                       index_meta.indisunique AS is_unique,
+                       access_method.amname AS access_method,
+                       index_meta.indpred IS NOT NULL AS is_partial,
+                       index_meta.indexprs IS NOT NULL AS is_expression,
+                       index_meta.indisvalid AS is_valid,
+                       index_meta.indisready AS is_ready,
+                       (
+                           index_meta.indpred IS NULL
+                           AND index_meta.indexprs IS NULL
+                           AND index_meta.indisvalid
+                           AND index_meta.indisready
+                           AND access_method.amname = 'btree'
+                       ) AS is_usable
+                  FROM pg_index index_meta
+                  JOIN pg_class table_class ON table_class.oid = index_meta.indrelid
+                  JOIN pg_namespace namespace ON namespace.oid = table_class.relnamespace
+                  JOIN pg_class index_class ON index_class.oid = index_meta.indexrelid
+                  JOIN pg_am access_method ON access_method.oid = index_class.relam
+                  JOIN LATERAL unnest(index_meta.indkey) WITH ORDINALITY key_part(attnum, ordinality)
+                    ON TRUE
+                  JOIN pg_attribute attribute
+                    ON attribute.attrelid = table_class.oid
+                   AND attribute.attnum = key_part.attnum
+                 WHERE namespace.nspname = %s AND table_class.relname = %s
+                 GROUP BY index_class.relname, index_meta.indisunique,
+                          access_method.amname, index_meta.indpred,
+                          index_meta.indexprs, index_meta.indisvalid,
+                          index_meta.indisready
+                 ORDER BY index_class.relname
+                """,
+                (schema, table),
+            )
+            return [dict(row) for row in cursor.fetchall()]
+
+
+def _unquote_identifier(identifier: str) -> str:
+    identifier = identifier.strip()
+    if len(identifier) > 1 and identifier[0] == identifier[-1] == '"':
+        return identifier[1:-1].replace('""', '"')
+    return identifier
+
+
+def _yugabyte_bucket(expression: str):
+    """Parse a tap-yugabyte keyset bucket key, ``(yb_hash_code(<columns>) % N)``."""
+    match = YB_BUCKET_EXPRESSION.match(expression or "")
+    if not match:
+        return None
+    return {
+        "columns": [_unquote_identifier(column) for column in match.group("columns").split(",")],
+        "modulus": int(match.group("modulus")),
+    }
+
+
+class YugabyteAdapter(PostgresAdapter):
+    """YugabyteDB YSQL metadata, plan, and aggregate operations.
+
+    YSQL shares PostgreSQL's SQL, so only index eligibility differs: every index uses
+    the ``lsm`` access method, and a hash-sharded key column cannot answer a range.
+    """
+
+    def __init__(self, connection, statement_timeout_seconds: int):
+        super().__init__(connection, statement_timeout_seconds)
+        # A failed read is cached too: the aborted transaction would mask it on a re-read.
+        self._indexes = {}
+
+    def indexes(self, schema, table):
+        """Return index metadata, marking which indexes can serve a window scan.
+
+        ``is_usable`` requires a valid, ready, non-partial ``lsm`` index whose leading
+        key column is range-sharded (``ASC`` or ``DESC``, not ``HASH``). An index led
+        by the tap-yugabyte keyset bucket ``(yb_hash_code(<primary key>) % N)`` is
+        described by ``bucket``, and its ``columns`` start after the bucket; it is
+        usable when the bucket hashes exactly the primary key and both the bucket and
+        the next key column are range-sharded plain keys.
+        """
+        key = (schema, table)
+        if key not in self._indexes:
+            try:
+                self._indexes[key] = [
+                    self._index_entry(row) for row in self._index_rows(schema, table)
+                ]
+            except Exception as exc:
+                self._indexes[key] = exc
+        if isinstance(self._indexes[key], Exception):
+            raise self._indexes[key]
+        return self._indexes[key]
+
+    def window_predicates(self, schema, table, timestamp_column):
+        """Constrain the bucket so a bucket-led index can serve wide windows.
+
+        ``yb_hash_code`` is never negative and primary-key columns are never NULL, so
+        the predicate matches every row; without it YugabyteDB seq-scans wide windows.
+        """
+        try:
+            indexes = self.indexes(schema, table)
+        except Exception:
+            # Preflight reads the same cached failure and records it as ERROR.
+            return []
+        leading = [
+            index for index in indexes
+            if index["is_usable"] and index["columns"][0].lower() == timestamp_column.lower()
+        ]
+        if not leading or any(index["bucket"] is None for index in leading):
+            return []
+        bucket = leading[0]["bucket"]
+        columns = ", ".join(self.quote(column) for column in bucket["columns"])
+        values = ", ".join(str(value) for value in range(bucket["modulus"]))
+        # Doubled because every caller binds the window boundaries as parameters.
+        return [f"(yb_hash_code({columns}) %% {bucket['modulus']}) IN ({values})"]
+
+    def _index_rows(self, schema, table):
+        with self.connection.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cursor:
+            cursor.execute(
+                """
+                SELECT index_class.relname AS index_name,
+                       access_method.amname AS access_method,
+                       index_meta.indisunique AS is_unique,
+                       index_meta.indpred IS NOT NULL AS is_partial,
+                       index_meta.indexprs IS NOT NULL AS is_expression,
+                       index_meta.indisvalid AS is_valid,
+                       index_meta.indisready AS is_ready,
+                       index_meta.indkey::int2[] AS key_attnums,
+                       index_meta.indoption::int2[] AS key_options,
+                       ARRAY(
+                           SELECT CASE
+                                      WHEN key_part.attnum = 0 THEN pg_get_indexdef(
+                                          index_meta.indexrelid, key_part.ordinality::int, true
+                                      )
+                                      ELSE attribute.attname
+                                  END
+                             FROM unnest(index_meta.indkey::int2[])
+                                  WITH ORDINALITY key_part(attnum, ordinality)
+                             LEFT JOIN pg_attribute attribute
+                               ON attribute.attrelid = index_meta.indrelid
+                              AND attribute.attnum = key_part.attnum
+                            WHERE key_part.ordinality <= index_meta.indnkeyatts
+                            ORDER BY key_part.ordinality
+                       ) AS key_columns,
+                       ARRAY(
+                           SELECT attribute.attname
+                             FROM pg_index primary_meta
+                             JOIN LATERAL unnest(primary_meta.indkey::int2[])
+                                  WITH ORDINALITY key_part(attnum, ordinality) ON TRUE
+                             JOIN pg_attribute attribute
+                               ON attribute.attrelid = primary_meta.indrelid
+                              AND attribute.attnum = key_part.attnum
+                            WHERE primary_meta.indrelid = index_meta.indrelid
+                              AND primary_meta.indisprimary
+                            ORDER BY key_part.ordinality
+                       ) AS primary_key
+                  FROM pg_index index_meta
+                  JOIN pg_class table_class ON table_class.oid = index_meta.indrelid
+                  JOIN pg_namespace namespace ON namespace.oid = table_class.relnamespace
+                  JOIN pg_class index_class ON index_class.oid = index_meta.indexrelid
+                  JOIN pg_am access_method ON access_method.oid = index_class.relam
+                 WHERE namespace.nspname = %s AND table_class.relname = %s
+                 ORDER BY index_class.relname
+                """,
+                (schema, table),
+            )
+            return cursor.fetchall()
+
+    @staticmethod
+    def _index_entry(row) -> dict:
+        columns = list(row["key_columns"])
+        is_expression = [attnum == 0 for attnum in row["key_attnums"][:len(columns)]]
+        is_ordered = [
+            option & YB_INDOPTION_HASH == 0 for option in row["key_options"][:len(columns)]
+        ]
+        is_healthy = (
+            row["access_method"] == "lsm"
+            and not row["is_partial"]
+            and row["is_valid"]
+            and row["is_ready"]
+        )
+        bucket = _yugabyte_bucket(columns[0]) if is_expression[0] else None
+        if bucket is None:
+            is_usable = is_healthy and not is_expression[0] and is_ordered[0]
+        else:
+            is_usable = (
+                is_healthy
+                and bucket["columns"] == list(row["primary_key"])
+                and len(columns) > 1
+                and is_ordered[0]
+                and not is_expression[1]
+                and is_ordered[1]
+            )
+            columns = columns[1:]
+        return {
+            "index_name": row["index_name"],
+            "columns": columns,
+            "is_unique": row["is_unique"],
+            "access_method": row["access_method"],
+            "is_partial": row["is_partial"],
+            "is_expression": row["is_expression"],
+            "is_valid": row["is_valid"],
+            "is_ready": row["is_ready"],
+            "is_usable": is_usable,
+            "bucket": bucket,
+        }
+
+
+class MySQLAdapter(DatabaseAdapter):
+    """MySQL and MariaDB metadata, plan, and aggregate operations."""
+
+    quote_character = "`"
+
+    def __init__(self, connection, statement_timeout_seconds: int):
+        super().__init__(connection, statement_timeout_seconds)
+        # Cached per connection: one catalog probe, however many tables follow.
+        self._visibility = _UNPROBED
+
+    def resolve_columns(self, schema, table, requested, *, allow_missing=False):
+        with self.connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT COLUMN_NAME AS column_name, DATA_TYPE AS data_type,
+                       COLUMN_TYPE AS udt_name,
+                       NUMERIC_PRECISION AS numeric_precision,
+                       NUMERIC_SCALE AS numeric_scale,
+                       DATETIME_PRECISION AS datetime_precision,
+                       CHARACTER_MAXIMUM_LENGTH AS character_maximum_length,
+                       IS_NULLABLE AS is_nullable
+                  FROM information_schema.COLUMNS
+                 WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s
+                """,
+                (schema, table),
+            )
+            available = cursor.fetchall()
+        return _match_columns(
+            schema, table, requested, available, allow_missing=allow_missing
+        )
+
+    def normalize_checksum_value(self, column):
+        name = self.quote(column["name"])
+        kind = column["checksum_kind"]
+        if kind == "string":
+            return f"CAST({name} AS CHAR)"
+        if kind == "exact_numeric":
+            factor = 10 ** column["checksum_scale"]
+            return f"CAST(CAST(ROUND({name} * {factor}, 0) AS DECIMAL(38, 0)) AS CHAR)"
+        if kind == "boolean":
+            # NULL must stay NULL so the outer marker distinguishes it from FALSE.
+            return f"IF({name} IS NULL, NULL, IF({name}, '1', '0'))"
+        # Specifiers are doubled because PyMySQL interpolates client-side: a bare
+        # %Y raises "unsupported format character" before the query is sent.
+        if kind == "timestamp":
+            return f"DATE_FORMAT({name}, '%%Y-%%m-%%d %%H:%%i:%%s.%%f')"
+        if kind == "time":
+            return f"DATE_FORMAT({name}, '%%H:%%i:%%s.%%f')"
+        if kind == "binary":
+            return f"LOWER(HEX({name}))"
+        raise DataDiffExecutionError(f"Unsupported checksum kind: {kind}")
+
+    def checksum_integer(self, payload):
+        # CONV returns a string, so subtracting coerces to DOUBLE and SUM() loses
+        # integer precision. The DECIMAL cast keeps MySQL agreeing with the others.
+        return (
+            f"(CAST(CONV(SUBSTRING(MD5({payload}), 21), 16, 10) AS DECIMAL(38, 0)) "
+            f"- {CHECKSUM_OFFSET})"
+        )
+
+    def _visibility_column(self):
+        """Return the STATISTICS column marking an index the optimizer will skip.
+
+        MySQL 8 spells it IS_VISIBLE ('NO' when INVISIBLE), MariaDB 10.6 spells it
+        IGNORED ('YES' when IGNORED), and MySQL 5.7 has neither. Probed rather than
+        assumed from VERSION(), which forks and backports make unreliable.
+        """
+        if self._visibility is _UNPROBED:
+            with self.connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT COLUMN_NAME AS column_name
+                      FROM information_schema.COLUMNS
+                     WHERE TABLE_SCHEMA = 'information_schema'
+                       AND TABLE_NAME = 'STATISTICS'
+                       AND COLUMN_NAME IN ('IS_VISIBLE', 'IGNORED')
+                    """
+                )
+                available = {
+                    str(row["column_name"] if isinstance(row, dict) else row[0]).upper()
+                    for row in cursor.fetchall()
+                }
+            # IS_VISIBLE first: a fork exposing both is MySQL-compatible.
+            self._visibility = next(
+                (name for name in ("IS_VISIBLE", "IGNORED") if name in available), None
+            )
+        return self._visibility
+
+    def indexes(self, schema, table):
+        visibility_column = self._visibility_column()
+        # The two columns carry opposite senses, so normalise to one flag here rather
+        # than at the comparison: NULL means "no such column", never "hidden".
+        hidden_value = "NO" if visibility_column == "IS_VISIBLE" else "YES"
+        visibility = (
+            f"{visibility_column} AS visibility" if visibility_column else "NULL AS visibility"
+        )
+        with self.connection.cursor() as cursor:
+            cursor.execute(
+                f"""
+                SELECT INDEX_NAME AS index_name, COLUMN_NAME AS column_name,
+                       SEQ_IN_INDEX AS sequence, NON_UNIQUE AS non_unique,
+                       INDEX_TYPE AS index_type, SUB_PART AS sub_part,
+                       {visibility}
+                  FROM information_schema.STATISTICS
+                 WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s
+                 ORDER BY INDEX_NAME, SEQ_IN_INDEX
+                """,
+                (schema, table),
+            )
+            rows = cursor.fetchall()
+        grouped = {}
+        for row in rows:
+            hidden = str(row["visibility"] or "").upper() == hidden_value
+            entry = grouped.setdefault(
+                row["index_name"],
+                {
+                    "index_name": row["index_name"],
+                    "columns": [],
+                    "is_unique": not row["non_unique"],
+                    "access_method": (row["index_type"] or "").lower(),
+                    # No partial indexes in MySQL, so what disqualifies is the access
+                    # method, a prefix length (cannot order a range), and an index the
+                    # optimizer is told to ignore -- EXPLAIN reports no possible keys
+                    # for those, so treating one as usable certifies a full scan.
+                    "is_usable": (
+                        str(row["index_type"] or "").upper() == "BTREE"
+                        and row["sub_part"] is None
+                        and not hidden
+                    ),
+                },
+            )
+            entry["columns"].append(row["column_name"])
+        return list(grouped.values())
+
+
+class SnowflakeAdapter(DatabaseAdapter):
+    """Snowflake metadata and aggregate operations."""
+
+    @sanitize_snowflake_errors
+    def resolve_columns(self, schema, table, requested, *, allow_missing=False):
+        import snowflake.connector
+
+        with self.connection.cursor(snowflake.connector.DictCursor) as cursor:
+            cursor.execute(
+                """
+                SELECT COLUMN_NAME AS column_name, DATA_TYPE AS data_type,
+                       DATA_TYPE AS udt_name,
+                       NUMERIC_PRECISION AS numeric_precision,
+                       NUMERIC_SCALE AS numeric_scale,
+                       DATETIME_PRECISION AS datetime_precision,
+                       CHARACTER_MAXIMUM_LENGTH AS character_maximum_length,
+                       IS_NULLABLE AS is_nullable
+                  FROM INFORMATION_SCHEMA.COLUMNS
+                 WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s
+                """,
+                (schema, table),
+            )
+            available = cursor.fetchall()
+        return _match_columns(
+            schema, table, requested, available, allow_missing=allow_missing
+        )
+
+    def normalize_checksum_value(self, column):
+        name = self.quote(column["name"])
+        kind = column["checksum_kind"]
+        if kind == "string":
+            return f"CAST({name} AS VARCHAR)"
+        if kind == "exact_numeric":
+            factor = 10 ** column["checksum_scale"]
+            return f"CAST(ROUND({name} * {factor}, 0) AS NUMBER(38, 0))::VARCHAR"
+        if kind == "boolean":
+            # NULL must stay NULL so the outer marker distinguishes it from FALSE.
+            return f"IFF({name} IS NULL, NULL, IFF({name}, '1', '0'))"
+        if kind == "timestamp":
+            return (
+                f"TO_CHAR(CONVERT_TIMEZONE('UTC', {name}), "
+                "'YYYY-MM-DD HH24:MI:SS.FF6')"
+            )
+        if kind == "time":
+            return f"TO_CHAR({name}, 'HH24:MI:SS.FF6')"
+        if kind == "binary":
+            return f"LOWER(HEX_ENCODE({name}))"
+        raise DataDiffExecutionError(f"Unsupported checksum kind: {kind}")
+
+    def checksum_integer(self, payload):
+        return (
+            f"(BITAND(MD5_NUMBER_LOWER64({payload}), {CHECKSUM_MASK}) "
+            f"- {CHECKSUM_OFFSET})"
+        )
+
+    @sanitize_snowflake_errors
+    def execute_metrics(self, sql, params, checks):
+        import snowflake.connector
+
+        started = perf_counter()
+        with self.connection.cursor(snowflake.connector.DictCursor) as cursor:
+            cursor.execute(sql, params)
+            row = cursor.fetchone()
+            if row is None:
+                raise DataDiffExecutionError("Aggregate query returned no row")
+        values_by_name = {str(key).lower(): value for key, value in row.items()}
+        return MetricQueryResult(
+            values={check: canonical_value(values_by_name[check]) for check in checks},
+            duration_seconds=perf_counter() - started,
+        )
+
+    def indexes(self, schema, table):  # pragma: no cover - targets are not preflighted
+        return []
+
+
+def _match_columns(schema, table, requested, available, *, allow_missing=False):
+    normalized_available = [
+        {str(key).lower(): value for key, value in dict(row).items()}
+        for row in available
+    ]
+    matches = {}
+    for requested_name in requested:
+        exact = [
+            row for row in normalized_available
+            if row["column_name"] == requested_name
+        ]
+        candidates = exact or [
+            row for row in normalized_available
+            if row["column_name"].lower() == requested_name.lower()
+        ]
+        if not candidates and allow_missing:
+            matches[requested_name] = {
+                "name": requested_name,
+                "data_type": None,
+                "missing": True,
+            }
+            continue
+        if len(candidates) != 1:
+            raise DataDiffExecutionError(
+                f"Column '{requested_name}' does not resolve uniquely in {schema}.{table}"
+            )
+        matches[requested_name] = dict(candidates[0])
+        matches[requested_name].update(
+            name=candidates[0]["column_name"],
+            missing=False,
+        )
+    return matches

@@ -1,0 +1,112 @@
+{
+  "definitions": {
+    "alert_slack": {
+      "type": "object",
+      "properties": {
+        "token": {
+          "type": "string"
+        },
+        "channel": {
+          "type": "string"
+        },
+        "data_diff_channel": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "token",
+        "channel"
+      ],
+      "additionalProperties": false
+    },
+    "alert_victorops": {
+      "type": "object",
+      "properties": {
+        "base_url": {
+          "type": "string"
+        },
+        "routing_key": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "base_url",
+        "routing_key"
+      ],
+      "additionalProperties": false
+    },
+    "backend_db": {
+      "type": "object",
+      "properties": {
+        "host": {
+          "type": "string",
+          "minLength": 1
+        },
+        "port": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        },
+        "user": {
+          "type": "string",
+          "minLength": 1
+        },
+        "password": {
+          "type": "string",
+          "minLength": 1
+        },
+        "dbname": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sslmode": {
+          "type": "string",
+          "enum": ["disable", "allow", "prefer", "require", "verify-ca", "verify-full"]
+        },
+        "connect_timeout": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "ddl_user": {
+          "type": "string",
+          "minLength": 1
+        },
+        "ddl_password": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": ["host", "user", "password", "dbname", "ddl_user", "ddl_password"],
+      "additionalProperties": false
+    }
+  },
+  "type": ["object", "null"],
+  "properties": {
+    "alert_handlers": {
+      "type": ["object", "null"],
+      "properties": {
+        "slack": { "$ref": "#/definitions/alert_slack" },
+        "victorops": { "$ref": "#/definitions/alert_victorops" }
+      },
+      "additionalProperties": false
+    },
+    "allowed_resync_max_size": {
+      "type": "object",
+      "properties": {
+        "table_mb": {
+          "type": "number"
+        }
+      },
+      "required": ["table_mb"]
+    },
+    "switch_over_data_file": {
+      "type": "string"
+    },
+    "backend_db": {
+      "$ref": "#/definitions/backend_db"
+    }
+  },
+  "required": [],
+  "additionalProperties": false
+}

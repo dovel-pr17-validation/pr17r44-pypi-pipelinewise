@@ -1,0 +1,12 @@
+{
+    "bookmarks": {
+        "foo_table": {
+            "log_file": "cVELOhjXNZ",
+            "log_pos": 79,
+            "version": 1
+        },
+        "bar_table": {
+            "foo": "bar"
+        }
+    }
+}

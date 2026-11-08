@@ -1,0 +1,230 @@
+import os
+from typing import Union
+
+import psycopg2
+import pymongo
+import pymysql
+import snowflake.connector
+
+from pymongo.database import Database
+
+from pipelinewise.utils import pem2der
+
+
+def run_query_postgres(query, host, port, user, password, database, params=None):
+    """Run and SQL query in a postgres database"""
+    result_rows = []
+    with psycopg2.connect(
+        host=host, port=port, user=user, password=password, database=database
+    ) as conn:
+        conn.set_session(autocommit=True)
+        with conn.cursor() as cur:
+            cur.execute(query, params)
+            if cur.rowcount > 0 and cur.description:
+                result_rows = cur.fetchall()
+    return result_rows
+
+
+def run_query_mysql(query, host, port, user, password, database, params=None):
+    """Run and SQL query in a mysql database"""
+    result_rows = []
+    with pymysql.connect(
+        host=host,
+        port=port,
+        user=user,
+        password=password,
+        database=database,
+        charset='utf8mb4',
+        cursorclass=pymysql.cursors.Cursor,
+        ssl={'': True},
+        autocommit=True,
+    ) as conn:
+        with conn.cursor() as cur:
+            cur.execute(query, params)
+            if cur.rowcount > 0:
+                result_rows = cur.fetchall()
+    return result_rows
+
+
+def run_query_snowflake(query, account, database, warehouse, user, private_key):
+    """Run and SQL query in a snowflake database"""
+    result_rows = []
+    with snowflake.connector.connect(
+        account=account,
+        database=database,
+        warehouse=warehouse,
+        user=user,
+        private_key=pem2der(private_key),
+        autocommit=True,
+        authenticator='SNOWFLAKE_JWT'
+    ) as conn:
+        with conn.cursor() as cur:
+            cur.execute(query)
+            if cur.rowcount > 0:
+                result_rows = cur.fetchall()
+    return result_rows
+
+
+def sql_get_columns_for_table(table_schema: str, table_name: str) -> list:
+    """Generate an SQL command that returns the list of column of a specific
+    table. Compatible with MySQL/ MariaDB/ Postgres and Snowflake
+
+    table_schema and table_name can be lowercase and uppercase strings.
+    It's using the IN clause to avoid transforming the entire
+    information_schema.columns table"""
+    return f"""
+    SELECT column_name
+      FROM information_schema.columns
+     WHERE table_schema IN ('{table_schema.upper()}', '{table_schema.lower()}')
+       AND table_name IN ('{table_name.upper()}', '{table_name.lower()}')"""
+
+
+def sql_get_columns_mysql(schemas: list) -> str:
+    """Generates an SQL command that gives the list of columns of every table
+    in a specific schema from a mysql database"""
+    sql_schemas = ', '.join(f"'{schema}'" for schema in schemas)
+
+    return f"""
+    SELECT table_name, GROUP_CONCAT(CONCAT(column_name, ':', data_type, ':', column_type)
+                                    ORDER BY column_name SEPARATOR ';')
+      FROM information_schema.columns
+     WHERE table_schema IN ({sql_schemas})
+     GROUP BY table_name
+     ORDER BY table_name"""
+
+
+def sql_get_columns_postgres(schemas: list) -> str:
+    """Generates an SQL command that gives the list of columns of every table
+    in a specific schema from a postgres database"""
+    sql_schemas = ', '.join(f"'{schema}'" for schema in schemas)
+
+    return f"""
+    SELECT table_name,
+           STRING_AGG(
+             CONCAT(column_name, ':', data_type, '::',
+                    CASE WHEN data_type = 'numeric' THEN numeric_precision::text ELSE '' END, ':',
+                    CASE WHEN data_type = 'numeric' THEN numeric_scale::text ELSE '' END),
+             ';' ORDER BY column_name)
+     FROM information_schema.columns
+    WHERE table_schema IN ({sql_schemas})
+    GROUP BY table_name
+    ORDER BY table_name"""
+
+
+def sql_get_columns_snowflake(schemas: list) -> str:
+    """Generates an SQL command that gives the list of columns of every table
+    in a specific schema from a snowflake database"""
+    sql_schemas = ', '.join(f"'{schema.upper()}'" for schema in schemas)
+    return f"""
+    SELECT table_name,
+           LISTAGG(
+             CONCAT(
+               column_name,
+               ':',
+               CASE
+                 WHEN data_type IN ('TEXT', 'VARCHAR')
+                   THEN CONCAT(
+                     'VARCHAR(', TO_VARCHAR(character_maximum_length), ')'
+                   )
+                 ELSE REPLACE(data_type, 'TEXT', 'VARCHAR')
+               END,
+               '::',
+               CASE WHEN data_type IN ('NUMBER', 'NUMERIC', 'DECIMAL')
+                 THEN COALESCE(TO_VARCHAR(numeric_precision), '') ELSE '' END,
+               ':',
+               CASE WHEN data_type IN ('NUMBER', 'NUMERIC', 'DECIMAL')
+                 THEN COALESCE(TO_VARCHAR(numeric_scale), '') ELSE '' END
+             ),
+             ';'
+           )
+                       WITHIN GROUP (ORDER BY column_name)
+     FROM information_schema.columns
+    WHERE table_schema IN ({sql_schemas})
+    GROUP BY table_name
+    ORDER BY table_name"""
+
+
+def sql_show_columns_snowflake(schema: str, database: str = None) -> str:
+    """Read physical type lengths omitted by INFORMATION_SCHEMA.COLUMNS."""
+    database = database if database is not None else os.environ['TARGET_SNOWFLAKE_DBNAME']
+    identifiers = [name.upper().replace('"', '""') for name in (database, schema)]
+    return 'SHOW COLUMNS IN SCHEMA ' + '.'.join(f'"{name}"' for name in identifiers)
+
+
+def sql_dynamic_row_count_mysql(schemas: list) -> str:
+    """Generates ans SQL statement that counts the number of rows in
+    every table in a specific schema(s) in a mysql database"""
+    sql_schemas = ', '.join(f"'{schema}'" for schema in schemas)
+
+    return f"""
+    WITH table_list AS (
+        SELECT table_name
+          FROM information_schema.tables
+         WHERE table_schema IN ({sql_schemas})
+           AND table_type = 'BASE TABLE')
+    SELECT CONCAT(
+           GROUP_CONCAT(CONCAT("SELECT '",LOWER(table_name),"' tbl, COUNT(*) row_count FROM `",table_name, "`")
+                        SEPARATOR " UNION "),
+           ' ORDER BY tbl')
+      FROM table_list
+    """
+
+
+def sql_dynamic_row_count_postgres(schemas: list) -> str:
+    """Generates ans SQL statement that counts the number of rows in
+    every table in a specific schema(s) in a postgres database"""
+    sql_schemas = ', '.join(f"'{schema}'" for schema in schemas)
+
+    return f"""
+    WITH table_list AS (
+        SELECT table_schema, table_name
+          FROM information_schema.tables
+         WHERE table_schema IN ({sql_schemas})
+           AND table_type = 'BASE TABLE')
+    SELECT CONCAT(
+           STRING_AGG(CONCAT('SELECT ''', LOWER(table_name), ''' tbl, COUNT(*) row_count FROM ',
+                             table_schema, '."', table_name, '"'),
+                      ' UNION '),
+           ' ORDER BY tbl')
+      FROM table_list
+    """
+
+
+def sql_dynamic_row_count_snowflake(schemas: list) -> str:
+    """Generates an SQL statement that counts the number of rows in
+    every table in a specific schema(s) in a Snowflake database"""
+    sql_schemas = ', '.join(f"'{schema.upper()}'" for schema in schemas)
+
+    return f"""
+    WITH table_list AS (
+        SELECT table_schema, table_name
+          FROM information_schema.tables
+         WHERE table_schema IN ({sql_schemas})
+           AND table_type = 'BASE TABLE')
+    SELECT CONCAT(
+           LISTAGG(CONCAT('SELECT ''', LOWER(table_name), ''' tbl, COUNT(*) row_count FROM ',
+                          table_schema, '."', table_name, '"'),
+                      ' UNION '),
+           ' ORDER BY tbl')
+      FROM table_list
+    """
+
+
+def get_mongodb_connection(
+    host: str,
+    port: Union[str, int],
+    user: str,
+    password: str,
+    database: str,
+    auth_database: str,
+) -> Database:
+    """
+    Creates a mongoDB connection to the db to sync from
+    Returns: Database instance with established connection
+
+    """
+    connection_string = (
+        f'mongodb://{user}:{password}@{host}:{port}/{database}?authSource={auth_database}'
+        '&tls=true&tlsAllowInvalidCertificates=true&directConnection=true'
+    )
+    return pymongo.MongoClient(connection_string)[database]

@@ -1,0 +1,716 @@
+import ast
+import os
+import subprocess
+from pathlib import Path
+
+import pytest
+import yaml
+
+
+REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+DETECTOR = REPOSITORY_ROOT / 'scripts' / 'ci_check_no_file_changes.sh'
+CONNECTOR_WORKFLOW = REPOSITORY_ROOT / '.github' / 'workflows' / 'connectors.yml'
+E2E_WORKFLOW = REPOSITORY_ROOT / '.github' / 'workflows' / 'e2e_tests.yml'
+TW_RULES = REPOSITORY_ROOT / '.github' / 'tw-rules.yaml'
+
+FAKE_CURL = r'''#!/usr/bin/env bash
+set -u
+
+page=''
+while (( $# > 0 )); do
+  case "$1" in
+    --data-urlencode)
+      if [[ $2 == page=* ]]; then
+        page=${2#page=}
+      fi
+      shift 2
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+
+printf '%s\n' "${page}" >> "${FAKE_CURL_LOG}"
+
+write_full_docs_page() {
+  printf '['
+  for ((index = 1; index <= 100; index += 1)); do
+    if (( index > 1 )); then
+      printf ','
+    fi
+    printf '{"filename":"docs/page-%s.rst"}' "${index}"
+  done
+  printf ']'
+}
+
+case "${FAKE_CURL_SCENARIO}:${page}" in
+  second_page_python:1)
+    write_full_docs_page
+    ;;
+  second_page_python:2)
+    printf '[{"filename":"pipelinewise/cli/pipelinewise.py"}]'
+    ;;
+  docs_only:1)
+    printf '[{"filename":"docs/index.rst"}]'
+    ;;
+  config_only:1)
+    printf '[{"filename":"dev-project/pipelinewise-config/config.yml"}]'
+    ;;
+  detector_only:1)
+    printf '[{"filename":"scripts/ci_check_no_file_changes.sh"}]'
+    ;;
+  lint_policy_only:1)
+    printf '[{"filename":"%s"}]' "${LINT_POLICY_FILE}"
+    ;;
+  e2e_workflow:1)
+    printf '[{"filename":".github/workflows/e2e_tests.yml"}]'
+    ;;
+  api_failure:1)
+    printf 'API unavailable\n' >&2
+    exit 22
+    ;;
+  invalid_response:1)
+    printf '{"message":"rate limit exceeded"}'
+    ;;
+  *)
+    printf 'Unexpected scenario or page: %s:%s\n' "${FAKE_CURL_SCENARIO}" "${page}" >&2
+    exit 2
+    ;;
+esac
+'''
+
+FAKE_JQ = r'''#!/usr/bin/env python3
+import json
+import sys
+
+
+try:
+    payload = json.load(sys.stdin)
+except (json.JSONDecodeError, OSError):
+    sys.exit(1)
+
+filenames_are_valid = isinstance(payload, list) and all(
+    isinstance(item, dict) and isinstance(item.get('filename'), str)
+    for item in payload
+)
+expression = sys.argv[-1]
+
+if expression.startswith('type =='):
+    sys.exit(0 if filenames_are_valid else 1)
+if not filenames_are_valid:
+    sys.exit(1)
+if expression == 'length':
+    print(len(payload))
+elif expression == '.[].filename':
+    for item in payload:
+        print(item['filename'])
+else:
+    sys.exit(2)
+'''
+
+
+def run_detector(tmp_path, scenario, *checks):
+    """Run the detector with deterministic GitHub API command doubles."""
+    fake_bin = tmp_path / 'bin'
+    fake_bin.mkdir()
+    fake_curl = fake_bin / 'curl'
+    fake_curl.write_text(FAKE_CURL, encoding='utf-8')
+    fake_curl.chmod(0o755)
+    fake_jq = fake_bin / 'jq'
+    fake_jq.write_text(FAKE_JQ, encoding='utf-8')
+    fake_jq.chmod(0o755)
+
+    request_log = tmp_path / 'curl-pages.log'
+    environment = os.environ.copy()
+    environment.update(
+        {
+            'FAKE_CURL_LOG': str(request_log),
+            'FAKE_CURL_SCENARIO': scenario,
+            'GITHUB_REPO': 'transferwise/pipelinewise',
+            'PATH': f'{fake_bin}:{environment["PATH"]}',
+            'PR_NUMBER': '1321',
+        }
+    )
+
+    result = subprocess.run(
+        [str(DETECTOR), *checks],
+        cwd=REPOSITORY_ROOT,
+        env=environment,
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    pages = request_log.read_text(encoding='utf-8').splitlines()
+    return result, pages
+
+
+def test_second_page_python_change_runs_ci(tmp_path):
+    """A relevant file after page one must run CI."""
+    result, pages = run_detector(tmp_path, 'second_page_python', 'python', 'config')
+
+    assert result.returncode == 1
+    assert pages == ['1', '2']
+    assert 'Detected changes in following file: pipelinewise/cli/pipelinewise.py' in result.stdout
+
+
+def test_docs_only_skips_python_config(tmp_path):
+    """Documentation-only changes may skip Python and config checks."""
+    result, pages = run_detector(tmp_path, 'docs_only', 'python', 'config')
+
+    assert result.returncode == 0
+    assert pages == ['1']
+    assert 'No changes detected... Exiting with SUCCESS code' in result.stdout
+
+
+def test_config_change_triggers_checks(tmp_path):
+    """A dev-project change must run Python and config checks."""
+    result, pages = run_detector(tmp_path, 'config_only', 'python', 'config')
+
+    assert result.returncode == 1
+    assert pages == ['1']
+    assert 'Detected changes in following file: dev-project/pipelinewise-config/config.yml' in result.stdout
+
+
+def test_detector_change_triggers_checks(tmp_path):
+    """A change to the detector must run its own regression tests."""
+    result, pages = run_detector(tmp_path, 'detector_only', 'python')
+
+    assert result.returncode == 1
+    assert pages == ['1']
+    assert 'Detected changes in following file: scripts/ci_check_no_file_changes.sh' in result.stdout
+
+
+@pytest.mark.parametrize(
+    'filename',
+    (
+        '.flake8',
+        '.github/workflows/connectors.yml',
+        '.github/workflows/e2e_tests.yml',
+        '.github/workflows/lint_unit_tests.yml',
+        '.github/workflows/publish_doc.yml',
+        '.pre-commit-config.yaml',
+        '.style.yapf',
+        'docs/conf.py',
+        'pylintrc',
+        'pyproject.toml',
+        'scripts/check_any_file_changed.py',
+    ),
+)
+def test_root_lint_input_change_triggers_checks(tmp_path, monkeypatch, filename):
+    """Changes to Ruff policy or files unique to its scope must run the workflow."""
+    monkeypatch.setenv('LINT_POLICY_FILE', filename)
+
+    result, pages = run_detector(tmp_path, 'lint_policy_only', 'python')
+
+    assert result.returncode == 1
+    assert pages == ['1']
+    assert f'Detected changes in following file: {filename}' in result.stdout
+
+
+def test_e2e_workflow_triggers_checks(tmp_path):
+    """An E2E workflow-only change must run the E2E jobs it defines."""
+    result, pages = run_detector(tmp_path, 'e2e_workflow', 'python', 'config', 'e2e')
+
+    assert result.returncode == 1
+    assert pages == ['1']
+    assert 'Detected changes in following file: .github/workflows/e2e_tests.yml' in result.stdout
+
+
+def test_decimal_integration_runner_change_triggers_e2e(tmp_path, monkeypatch):
+    """The integration runner itself must not bypass the jobs that execute it."""
+    monkeypatch.setenv('LINT_POLICY_FILE', 'scripts/test_decimal_connectors.sh')
+    result, pages = run_detector(tmp_path, 'lint_policy_only', 'python', 'config', 'e2e')
+    assert result.returncode == 1
+    assert pages == ['1']
+
+
+def test_snowflake_e2e_matrix_contract():
+    """Snowflake shards cover every route exactly once with full parallelism."""
+    workflow = yaml.safe_load(E2E_WORKFLOW.read_text(encoding='utf-8'))
+    jobs = workflow['jobs']
+    job = jobs['e2e_tests_snowflake']
+    strategy = job['strategy']
+    shards = strategy['matrix']['include']
+
+    assert workflow['concurrency']['group'] == (
+        'e2e_tests-${{ github.event.pull_request.number || github.ref_name }}'
+    )
+    assert 'needs' not in job
+    assert job['name'] == '${{ matrix.check_name }}'
+    assert strategy['fail-fast'] is False
+    assert 'max-parallel' not in strategy
+    assert len(shards) == 22
+
+    expected_shards = {
+        'conversion': (
+            'e2e_tests_02',
+            (
+                'tests/end_to_end/target_snowflake/tap_postgres/test_auto_native_to_iceberg_pg_to_sf.py',
+                'tests/end_to_end/data_diff/test_mysql_to_snowflake.py',
+                'tests/end_to_end/target_snowflake/tap_mariadb/test_replicate_mariadb_replica_to_sf.py',
+            ),
+        ),
+        'publication': (
+            'e2e_tests_03',
+            (
+                'tests/end_to_end/target_snowflake/tap_postgres/test_snowflake_iceberg_publisher.py',
+            ),
+        ),
+        'pg-partial': (
+            'e2e_tests_04',
+            (
+                'tests/end_to_end/target_snowflake/tap_postgres/test_partial_sync_pg_to_sf.py',
+                'tests/end_to_end/target_snowflake/tap_postgres/test_multiline_native_pg_to_sf.py',
+                'tests/end_to_end/data_diff/test_postgres_to_snowflake.py',
+                'tests/end_to_end/target_snowflake/tap_mariadb/test_partial_sync_mariadb_to_sf.py::TestPartialSyncMariaDBToSF::test_partial_sync_removes_existing_row_deleted_from_source',
+            ),
+        ),
+        'mariadb-partial': (
+            'e2e_tests_05',
+            (
+                'tests/end_to_end/target_snowflake/tap_mariadb/test_partial_sync_mariadb_to_sf.py::TestPartialSyncMariaDBToSF::test_partial_sync_if_table_does_not_exist_in_target',
+                'tests/end_to_end/target_snowflake/tap_mariadb/test_partial_sync_mariadb_to_sf.py::TestPartialSyncMariaDBToSF::test_terminated_partial_sync_kills_blocked_source_query',
+                'tests/end_to_end/target_snowflake/tap_mariadb/test_partial_sync_mariadb_to_sf.py::TestPartialSyncMariaDBToSF::test_partial_sync_if_there_is_additional_column_in_source',
+                'tests/end_to_end/target_snowflake/tap_mariadb/test_partial_sync_mariadb_to_sf.py::TestPartialSyncMariaDBToSF::test_partial_sync_if_there_is_additional_column_in_target',
+                'tests/end_to_end/target_snowflake/tap_mariadb/test_partial_sync_mariadb_to_sf.py::TestPartialSyncMariaDBToSF::test_partial_sync_mariadb_to_sf',
+                'tests/end_to_end/target_snowflake/tap_mariadb/test_partial_sync_mariadb_to_sf.py::TestPartialSyncMariaDBToSF::test_unbounded_empty_range_removes_target_only_row',
+                'tests/end_to_end/target_snowflake/tap_yugabyte/test_replicate_yugabyte_to_sf.py',
+            ),
+        ),
+        'pg-iceberg': (
+            'e2e_tests_06',
+            (
+                'tests/end_to_end/target_snowflake/tap_postgres/test_iceberg_v3_postgres_to_sf.py::TestIcebergV3PostgresToSnowflake::test_full_and_bounded_partial_sync_preserve_multiline_bytes',
+                'tests/end_to_end/target_snowflake/tap_postgres/test_iceberg_v3_postgres_to_sf.py::TestIcebergV3PostgresToSnowflake::test_fullsync_hands_over_to_singer_on_managed_iceberg_v3',
+                'tests/end_to_end/target_snowflake/tap_mysql/test_iceberg_v3_mysql_to_sf.py::TestIcebergV3MySQLToSnowflake::test_fullsync_hands_over_to_singer_on_managed_iceberg_v3',
+            ),
+        ),
+        'mariadb-iceberg': (
+            'e2e_tests_07',
+            (
+                'tests/end_to_end/target_snowflake/tap_mariadb/test_iceberg_v3_mariadb_to_sf.py',
+                'tests/end_to_end/target_snowflake/tap_mongodb/test_replicate_mongodb_to_sf.py',
+                'tests/end_to_end/test_numeric_replication.py::test_mysql_float_exact_snowflake',
+            ),
+        ),
+        'mysql-iceberg': (
+            'e2e_tests_08',
+            (
+                'tests/end_to_end/target_snowflake/test_source_transformation_exports.py',
+                'tests/end_to_end/target_snowflake/tap_mysql/test_iceberg_v3_mysql_to_sf.py::TestIcebergV3MySQLToSnowflake::test_full_and_bounded_partial_sync_preserve_multiline_bytes',
+                'tests/end_to_end/target_snowflake/tap_mysql/test_iceberg_v3_mysql_to_sf.py::TestIcebergV3MySQLToSnowflake::test_partial_sync_merges_a_bounded_range_into_managed_iceberg_v3',
+                'tests/end_to_end/target_snowflake/tap_mysql/test_multiline_native_mysql_to_sf.py',
+                'tests/end_to_end/target_snowflake/tap_postgres/test_defined_partial_sync_pg_to_sf.py',
+                'tests/end_to_end/target_snowflake/tap_s3/test_replicate_s3_to_sf.py',
+                'tests/end_to_end/target_snowflake/tap_mariadb/test_resync_mariadb_to_sf.py',
+                'tests/end_to_end/target_snowflake/tap_postgres/test_replicate_pg_to_sf_with_archive_load_files.py',
+                'tests/end_to_end/test_numeric_replication.py::test_legacy_decimal_float_migration_requires_opt_in[postgres-native]',
+            ),
+        ),
+        'mariadb-native': (
+            'e2e_tests_09',
+            (
+                'tests/end_to_end/target_snowflake/tap_mariadb/test_resync_mariadb_to_sf_table_size_check.py',
+                'tests/end_to_end/target_snowflake/tap_mariadb/test_replicate_mariadb_to_sf.py',
+                'tests/end_to_end/target_snowflake/tap_mariadb/test_multiline_native_mariadb_to_sf.py',
+                'tests/end_to_end/target_snowflake/tap_mariadb/test_defined_partial_sync_mariadb_to_sf.py',
+                'tests/end_to_end/target_snowflake/tap_mariadb/test_resync_mariadb_to_sf_with_split_large_files.py',
+                'tests/end_to_end/test_numeric_replication.py::test_decimal_fallback_snowflake[mariadb-native]',
+            ),
+        ),
+        'decimal-fastsync-postgres': (
+            'e2e_tests_10',
+            (
+                'tests/end_to_end/test_numeric_replication.py::test_decimal_fastsync_snowflake[postgres-native]',
+                'tests/end_to_end/test_numeric_replication.py::test_decimal_fastsync_snowflake[yugabyte-native]',
+                'tests/end_to_end/target_snowflake/test_source_transformation_publication.py::test_transformations_are_private_through_publication',
+                'tests/end_to_end/target_snowflake/tap_postgres/test_iceberg_v3_postgres_to_sf.py::TestIcebergV3PostgresToSnowflake::test_partial_sync_merges_a_bounded_range_into_managed_iceberg_v3',
+            ),
+        ),
+        'decimal-migration': (
+            'e2e_tests_11',
+            (
+                'tests/end_to_end/test_numeric_replication.py::test_legacy_decimal_float_migration_requires_opt_in[mysql-native]',
+                'tests/end_to_end/test_numeric_replication.py::test_legacy_decimal_float_migration_requires_opt_in[mysql-v3]',
+                'tests/end_to_end/test_numeric_replication.py::test_legacy_decimal_float_migration_requires_opt_in[mariadb-v3]',
+            ),
+        ),
+        'decimal-fallback-postgres': (
+            'e2e_tests_12',
+            (
+                'tests/end_to_end/test_numeric_replication.py::test_decimal_fallback_snowflake[postgres-native]',
+                'tests/end_to_end/test_numeric_replication.py::test_decimal_fallback_snowflake[postgres-v3]',
+                'tests/end_to_end/target_snowflake/tap_mariadb/test_replicate_mariadb_to_sf_with_custom_buffer_size.py',
+                'tests/end_to_end/test_numeric_replication.py::test_legacy_decimal_float_migration_requires_opt_in[postgres-v3]',
+                'tests/end_to_end/test_numeric_replication.py::test_legacy_decimal_float_migration_requires_opt_in[mariadb-native]',
+            ),
+        ),
+        'transformation-parity': (
+            'e2e_tests_13',
+            (
+                'tests/end_to_end/target_snowflake/test_source_transformation_publication.py::test_singer_and_fastsync_preserve_mapped_types_and_values',
+                'tests/end_to_end/target_snowflake/test_source_transformation_publication.py::test_existing_singer_semantic_differences_remain_explicit',
+                'tests/end_to_end/target_snowflake/test_source_transformation_publication.py::test_ambiguous_regex_is_rejected_before_export',
+                'tests/end_to_end/target_snowflake/test_source_transformation_publication.py::test_bit_varying_conditions_match_snowflake',
+            ),
+        ),
+        'numeric-boundaries': (
+            'e2e_tests_14',
+            (
+                'tests/end_to_end/test_numeric_replication.py::test_yugabyte_bounded_numeric_key_snowflake',
+                'tests/end_to_end/test_numeric_replication.py::test_mysql_bounded_decimal_key_snowflake',
+                'tests/end_to_end/test_numeric_replication.py::test_mysql_extended_types_snowflake',
+                'tests/end_to_end/test_numeric_replication.py::test_mysql_legacy_binary_width_partial_sync_snowflake',
+                'tests/end_to_end/target_snowflake/tap_mongodb/test_auto_native_to_iceberg_mongodb_to_sf.py',
+            ),
+        ),
+        'connector-evolution': (
+            'e2e_tests_15',
+            (),
+        ),
+        'connector-keys': (
+            'e2e_tests_16',
+            (
+                'tests/end_to_end/target_snowflake/test_native_to_iceberg_converter.py',
+            ),
+        ),
+        'postgres-maintenance': (
+            'e2e_tests_17',
+            (
+                'tests/end_to_end/target_snowflake/tap_postgres/test_resync_pg_to_sf_table_size_check.py',
+                'tests/end_to_end/target_snowflake/tap_postgres/test_replicate_pg_to_sf.py',
+                'tests/end_to_end/test_numeric_replication.py::test_decimal_fastsync_snowflake[postgres-v3]',
+            ),
+        ),
+        'decimal-fastsync-mysql-family': (
+            'e2e_tests_18',
+            (
+                'tests/end_to_end/test_numeric_replication.py::test_decimal_fastsync_snowflake[mysql-native]',
+                'tests/end_to_end/test_numeric_replication.py::test_decimal_fastsync_snowflake[mysql-v3]',
+                'tests/end_to_end/test_numeric_replication.py::test_decimal_fastsync_snowflake[mariadb-native]',
+                'tests/end_to_end/test_numeric_replication.py::test_decimal_fastsync_snowflake[mariadb-v3]',
+            ),
+        ),
+        'decimal-fallback-mysql-family': (
+            'e2e_tests_19',
+            (
+                'tests/end_to_end/test_numeric_replication.py::test_decimal_fallback_snowflake[mysql-native]',
+                'tests/end_to_end/test_numeric_replication.py::test_decimal_fallback_snowflake[mysql-v3]',
+                'tests/end_to_end/test_numeric_replication.py::test_decimal_fallback_snowflake[mariadb-v3]',
+            ),
+        ),
+        'connector-overflow': (
+            'e2e_tests_20',
+            (
+                'tests/end_to_end/target_snowflake/tap_mysql/test_iceberg_v3_mysql_to_sf.py::TestIcebergV3MySQLToSnowflake::test_iceberg_replication_preserves_keys_and_supplementary_unicode',
+            ),
+        ),
+        'yugabyte-partial': (
+            'e2e_tests_21',
+            (
+                'tests/end_to_end/target_snowflake/tap_yugabyte/test_partial_sync_yugabyte_to_sf.py',
+                'tests/end_to_end/target_snowflake/tap_yugabyte/test_partial_sync_repair_yugabyte_to_sf.py',
+                'tests/end_to_end/target_snowflake/tap_postgres/test_resync_pg_to_sf_with_split_large_files.py',
+            ),
+        ),
+        'yugabyte-recovery': (
+            'e2e_tests_22',
+            (
+                'tests/end_to_end/test_yugabyte_recovery.py',
+            ),
+        ),
+        'postgres-float-parity': (
+            'e2e_tests_23',
+            (
+                'tests/end_to_end/test_numeric_replication.py::test_postgres_float_nonfinite_snowflake',
+                'tests/end_to_end/test_numeric_replication.py::test_postgres_bounded_numeric_key_snowflake',
+            ),
+        ),
+    }
+    actual_shards = {
+        shard['shard']: (shard['check_name'], tuple(shard['test_paths'].split()))
+        for shard in shards
+    }
+    assert actual_shards == expected_shards
+
+    configured_selectors = [
+        selector
+        for _, test_paths in actual_shards.values()
+        for selector in test_paths
+    ]
+    expected_paths = {
+        str(path.relative_to(REPOSITORY_ROOT))
+        for path in (
+            REPOSITORY_ROOT / 'tests' / 'end_to_end' / 'target_snowflake'
+        ).rglob('test_*.py')
+    }
+    expected_paths.update(
+        {
+            'tests/end_to_end/data_diff/test_mysql_to_snowflake.py',
+            'tests/end_to_end/data_diff/test_postgres_to_snowflake.py',
+            'tests/end_to_end/test_numeric_replication.py',
+            'tests/end_to_end/test_yugabyte_recovery.py',
+        }
+    )
+    postgres_decimal_tests = {
+        'tests/end_to_end/test_numeric_replication.py::test_decimal_fastsync_postgres',
+        'tests/end_to_end/test_numeric_replication.py::test_postgres_decimal_float_underflow',
+    }
+    postgres_commands = '\n'.join(step.get('run', '') for step in jobs['e2e_tests_01']['steps'])
+    for selector in postgres_decimal_tests:
+        assert postgres_commands.count(selector) == 1
+    expected_tests = set()
+    tests_by_path = {}
+    for test_path in expected_paths:
+        module = ast.parse((REPOSITORY_ROOT / test_path).read_text(encoding='utf-8'))
+        test_ids = {
+            f'{test_path}::{node.name}'
+            for node in module.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith('test_')
+        }
+        test_ids.update(
+            f'{test_path}::{node.name}::{method.name}'
+            for node in module.body
+            if isinstance(node, ast.ClassDef) and node.name.startswith('Test')
+            for method in node.body
+            if isinstance(method, (ast.FunctionDef, ast.AsyncFunctionDef)) and method.name.startswith('test_')
+        )
+        test_ids.difference_update(postgres_decimal_tests)
+        assert test_ids, test_path
+        tests_by_path[test_path] = test_ids
+        expected_tests.update(test_ids)
+
+    selected_tests = []
+    for selector in configured_selectors:
+        test_path, _, test_name = selector.partition('::')
+        assert test_path in expected_paths, selector
+        if test_name:
+            base_selector = selector.partition('[')[0]
+            assert base_selector in tests_by_path[test_path], selector
+            selected_tests.append(base_selector)
+        else:
+            selected_tests.extend(tests_by_path[test_path])
+
+    assert set(selected_tests) == expected_tests
+    split_test_counts = {
+        'tests/end_to_end/test_numeric_replication.py::test_decimal_fastsync_snowflake': 7,
+        'tests/end_to_end/test_numeric_replication.py::test_decimal_fallback_snowflake': 6,
+        'tests/end_to_end/test_numeric_replication.py::test_legacy_decimal_float_migration_requires_opt_in': 6,
+    }
+    assert all(
+        selected_tests.count(test_id) == split_test_counts.get(test_id, 1)
+        for test_id in expected_tests
+    )
+
+    commands = '\n'.join(step.get('run', '') for step in job['steps'])
+    assert job['env']['E2E_TEST_PATHS'] == '${{ matrix.test_paths }}'
+    assert 'pipelinewise pytest $E2E_TEST_PATHS' in commands
+    assert 'set -f' in commands
+    assert '-e PIPELINEWISE_E2E_NAMESPACE=$PIPELINEWISE_E2E_NAMESPACE' in commands
+    assert '${{ github.run_id }}' in job['env']['PIPELINEWISE_E2E_NAMESPACE']
+    assert '${{ github.run_attempt }}' in job['env']['PIPELINEWISE_E2E_NAMESPACE']
+    assert '${{ matrix.shard }}' in job['env']['PIPELINEWISE_E2E_NAMESPACE']
+    connector_shards = {
+        shard['shard']: tuple(shard.get('connector_test_paths', '').split())
+        for shard in shards
+        if shard.get('connector_test_paths')
+    }
+    assert connector_shards == {
+        'publication': (
+            'tests/integration/test_decimals.py::test_numeric_array_json_text_loads_like_parse_json_without_versioning',
+            'tests/integration/test_decimals.py::test_native_nan_float_key_loaded_twice_keeps_one_row',
+        ),
+        'mysql-iceberg': (
+            'tests/integration/test_decimals.py::test_postgres_bounded_numeric_key_keeps_nan_and_canonical_identity',
+        ),
+        'decimal-migration': (
+            'tests/integration/test_decimals.py::test_float_tokens_load_nonfinite_values_into_existing_float_column',
+        ),
+        'connector-evolution': (
+            'tests/integration/test_decimals.py::test_opt_in_exact_decimal_load_versions_history_and_retries_without_reversion',
+            'tests/integration/test_decimals.py::test_decimal_precision_reversal_in_one_process_refreshes_startup_cache',
+            'tests/integration/test_decimals.py::test_decimal_archive_bounds_preserve_exact_text_and_ignore_nulls',
+            'tests/integration/test_runtime_contracts.py::test_cli_loads_utf8_and_acknowledges_committed_state',
+            'tests/integration/test_runtime_contracts.py::test_cli_rejects_invalid_file_format_before_loading',
+            'tests/integration/test_runtime_contracts.py::test_rejects_managed_text_variant_changes_without_versioning',
+            'tests/integration/test_decimals.py::test_float_fallback_keys_preserve_distinct_rows_across_batches',
+            'tests/integration/test_runtime_contracts.py::test_rejects_managed_merge_on_read_before_schema_changes',
+            'tests/integration/test_decimals.py::test_bounded_nan_retains_rows_in_copy_and_merge',
+        ),
+        'connector-keys': (
+            'tests/integration/test_decimals.py::test_legacy_text_binary_key_matches_uppercase_fastsync_hex',
+            'tests/integration/test_runtime_contracts.py::test_rejects_managed_v2_before_schema_changes',
+        ),
+        'decimal-fastsync-mysql-family': (
+            'tests/integration/test_runtime_contracts.py::test_sparse_patch_batches_preserve_omitted_values_and_apply_null',
+            'tests/integration/test_runtime_contracts.py::test_polymorphic_and_untyped_source_fields_load_after_flattening',
+        ),
+        'decimal-fallback-mysql-family': (
+            'tests/integration/test_runtime_contracts.py::test_failed_copy_or_merge_does_not_acknowledge_state',
+            'tests/integration/test_decimals.py::test_decimal_primary_keys_coalesce_equal_numeric_values',
+        ),
+        'connector-overflow': (
+            'tests/integration/test_decimals.py::test_float_fallback_retains_overflow_rows_nulls_and_stable_column',
+            'tests/integration/test_decimals.py::test_decimal_key_change_retains_existing_type_and_adds_other_columns',
+        ),
+        'yugabyte-recovery': (
+            'tests/integration/test_decimals.py::test_mysql_extended_composite_key_upgrade_preserves_historical_updates_and_deletes',
+            'tests/integration/test_runtime_contracts.py::test_rejects_table_format_change_without_altering_rows',
+        ),
+        'postgres-float-parity': (
+            'tests/integration/test_decimals.py::test_legacy_float_decimal_keys_coalesce_collisions_and_keep_last_patch_and_delete',
+        ),
+    }
+    connector_test_directory = (
+        REPOSITORY_ROOT
+        / 'singer-connectors'
+        / 'target-snowflake'
+        / 'tests'
+        / 'integration'
+    )
+    expected_connector_tests = {
+        f'tests/integration/{filename}::{node.name}'
+        for filename in ('test_decimals.py', 'test_runtime_contracts.py')
+        for node in ast.parse((connector_test_directory / filename).read_text(encoding='utf-8')).body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name.startswith('test_')
+    }
+    selected_connector_tests = [
+        selector
+        for selectors in connector_shards.values()
+        for selector in selectors
+    ]
+    assert len(selected_connector_tests) == len(set(selected_connector_tests))
+    assert set(selected_connector_tests) == expected_connector_tests
+    connector_step = next(
+        step for step in job['steps']
+        if step['name'] == 'Run Snowflake decimal connector integrations'
+    )
+    assert connector_step['if'] == (
+        "steps.check.outcome == 'failure' && matrix.connector_test_paths != ''"
+    )
+    assert '${{ matrix.connector_test_paths }}' in connector_step['run']
+    e2e_step = next(
+        step for step in job['steps']
+        if step['name'] == 'Run Snowflake end-to-end shard'
+    )
+    assert e2e_step['if'] == (
+        "steps.check.outcome == 'failure' && matrix.test_paths != ''"
+    )
+
+    retired_jobs = {
+        'e2e_tests_target_pg',
+        'e2e_tests_mariadb_to_sf',
+        'e2e_tests_mysql_to_sf',
+        'e2e_tests_pg_to_sf',
+        'e2e_tests_mg_to_sf',
+        'e2e_tests_s3_to_sf',
+    }
+    assert retired_jobs.isdisjoint(jobs)
+
+    target_pg_job = jobs['e2e_tests_01']
+    target_pg_commands = '\n'.join(
+        step.get('run', '') for step in target_pg_job['steps']
+    )
+    assert '${{ github.run_id }}' in target_pg_job['env']['PIPELINEWISE_E2E_NAMESPACE']
+    assert '${{ github.run_attempt }}' in target_pg_job['env']['PIPELINEWISE_E2E_NAMESPACE']
+    assert (
+        '-e PIPELINEWISE_E2E_NAMESPACE=$PIPELINEWISE_E2E_NAMESPACE'
+        in target_pg_commands
+    )
+    readiness_steps = [
+        step
+        for configured_job in jobs.values()
+        for step in configured_job['steps']
+        if step.get('name') == 'Wait for test containers to be ready'
+    ]
+    assert len(readiness_steps) == 2
+    for readiness_step in readiness_steps:
+        assert 'docker logs --tail 50 pipelinewise' in readiness_step['run']
+        assert 'sleep 5' in readiness_step['run']
+        assert 'sleep 30' not in readiness_step['run']
+        assert (
+            "container_status=$(docker inspect --format '{{.State.Status}}' pipelinewise)"
+            in readiness_step['run']
+        )
+        assert 'PipelineWise container stopped with status' in readiness_step['run']
+        assert 'exit 1' in readiness_step['run']
+
+
+def test_required_e2e_status_contract():
+    """Repository rules require every numbered E2E shard exactly once."""
+    workflow = yaml.safe_load(E2E_WORKFLOW.read_text(encoding='utf-8'))
+    rules = yaml.safe_load(TW_RULES.read_text(encoding='utf-8'))
+    shards = workflow['jobs']['e2e_tests_snowflake']['strategy']['matrix']['include']
+    expected_statuses = {'e2e_tests_01'} | {
+        shard['check_name'] for shard in shards
+    }
+    configured_checks = rules['actions']['branch-protection-settings']['branches'][0]['checks']
+    configured_names = [check['name'] for check in configured_checks]
+    required_statuses = {
+        name for name in configured_names if name.startswith('e2e_tests_')
+    }
+
+    assert len(configured_names) == len(set(configured_names))
+    assert expected_statuses == {
+        f'e2e_tests_{shard_number:02d}' for shard_number in range(1, 24)
+    }
+    assert required_statuses == expected_statuses
+    assert not {
+        'e2e_tests_mariadb_to_sf',
+        'e2e_tests_mg_to_sf',
+        'e2e_tests_pg_to_sf',
+        'e2e_tests_s3_to_sf',
+    }.intersection(configured_names)
+
+
+def test_required_connector_status_contract():
+    """Branch protection requires the aggregate connector test result."""
+    workflow = yaml.safe_load(CONNECTOR_WORKFLOW.read_text(encoding='utf-8'))
+    rules = yaml.safe_load(TW_RULES.read_text(encoding='utf-8'))
+    aggregate = workflow['jobs']['connector_tests']
+    configured_checks = rules['actions']['branch-protection-settings']['branches'][0]['checks']
+    configured_names = [check['name'] for check in configured_checks]
+
+    assert aggregate['name'] == 'connector_tests'
+    assert set(aggregate['needs']) == {
+        'test_connector_units', 'test_shared_singer', 'test_tap_yugabyte_index_check'}
+    assert aggregate['if'] == '${{ always() }}'
+    assert 'connector_tests' in configured_names
+
+
+def test_snowflake_e2e_matrix_preflight_once():
+    """Every Snowflake shard runs one complete preflight command."""
+    workflow = yaml.safe_load(E2E_WORKFLOW.read_text(encoding='utf-8'))
+    job = workflow['jobs']['e2e_tests_snowflake']
+    preflight_steps = [
+        step
+        for step in job['steps']
+        if step.get('name')
+        == 'Validate required Snowflake end-to-end configuration'
+    ]
+
+    assert len(preflight_steps) == 1
+    assert preflight_steps[0]['if'] == "steps.check.outcome == 'failure'"
+    assert preflight_steps[0]['run'].count('./scripts/ci_require_env.sh') == 1
+
+
+def test_api_failure_triggers_checks(tmp_path):
+    """An API failure must run CI rather than produce a false green."""
+    result, pages = run_detector(tmp_path, 'api_failure', 'python')
+
+    assert result.returncode == 1
+    assert pages == ['1']
+    assert 'Unable to determine changed files; Exiting with FAILURE code' in result.stdout
+    assert 'Failed to fetch changed files from GitHub' in result.stderr
+
+
+def test_invalid_response_triggers_checks(tmp_path):
+    """A malformed API response must run CI rather than skip it."""
+    result, pages = run_detector(tmp_path, 'invalid_response', 'python')
+
+    assert result.returncode == 1
+    assert pages == ['1']
+    assert 'Unable to determine changed files; Exiting with FAILURE code' in result.stdout
+    assert 'GitHub changed-files response is invalid' in result.stderr

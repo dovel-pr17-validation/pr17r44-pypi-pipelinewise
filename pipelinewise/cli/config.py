@@ -1,0 +1,925 @@
+"""
+PipelineWise CLI - Configuration class
+"""
+import logging
+import os
+import sys
+import json
+
+from typing import Dict, List, Union
+
+from pipelinewise.data_diff.config import extract_check_definitions
+from pipelinewise.fastsync.commons.source_transformations import (
+    UnsupportedSourceTransformation,
+    validate_bookmark_column,
+    validate_source_transformation_config,
+)
+from pipelinewise.utils import safe_column_name
+from . import fastsync_capabilities, utils
+from .errors import InvalidConfigException, InvalidTransformationException
+
+
+class Config:
+    """PipelineWise Configuration Class"""
+
+    TABLE_FORMAT_NATIVE = fastsync_capabilities.TABLE_FORMAT_NATIVE
+    TABLE_FORMAT_ICEBERG = fastsync_capabilities.TABLE_FORMAT_ICEBERG
+    ICEBERG_VERSION = 3
+    VERSION_LEGACY_FLOAT_COLUMNS_SETTING = 'version_legacy_float_columns'
+    # psycopg2-yugabytedb 2.9.3.5 and 2.9.3.5.post1 replace the configured port with 5433 on replication connections.
+    YUGABYTE_REPLICATION_PORT = 5433
+    TARGET_FORMAT_KEYS = {
+        'iceberg_create',
+        'iceberg_version',
+        'target_table_format',
+    }
+    NATIVE_TO_ICEBERG_CONVERSION = 'native_to_iceberg_conversion'
+
+    def __init__(self, config_dir):
+        """
+        Class Constructor
+
+        Initialising a configuration with an empty list of data flows
+        """
+        self.logger = logging.getLogger(__name__)
+        self.config_dir = config_dir
+        self.config_path = os.path.join(self.config_dir, 'config.json')
+        self.global_config = {}
+        self.targets = {}
+
+    @classmethod
+    def from_yamls(cls, config_dir, yaml_dir='.', vault_secret=None):
+        """
+        Class Constructor
+
+        Initialising a configuration from YAML files.
+
+        Pipelinewise can import and generate singer configurations files
+        from human friendly easy to understand YAML files.
+        """
+        config = cls(config_dir)
+        targets = {}
+        taps = {}
+
+        config.logger.info('Searching YAML config files in %s', yaml_dir)
+        global_config_yaml = os.path.join(yaml_dir, 'config.yml')
+        tap_yamls, target_yamls = utils.get_tap_target_names(yaml_dir)
+
+        global_config_schema = utils.load_schema('config')
+        target_schema = utils.load_schema('target')
+        tap_schema = utils.load_schema('tap')
+
+        # Load global config yaml
+        if os.path.exists(global_config_yaml):
+            global_config = utils.load_yaml(global_config_yaml, vault_secret)
+            utils.validate(instance=global_config, schema=global_config_schema)
+            config.global_config = global_config or {}
+
+        # Load every target yaml into targets dictionary
+        for yaml_file in target_yamls:
+            config.logger.info('LOADING TARGET: %s', yaml_file)
+            target_data = utils.load_yaml(
+                os.path.join(yaml_dir, yaml_file), vault_secret
+            )
+            cls.validate_target_table_format_placement(target_data)
+            cls.validate_native_to_iceberg_conversion_placement(target_data, 'Target')
+            cls.validate_snowflake_decimal_versioning_placement(target_data)
+            cls.validate_snowflake_query_history_poll_timeout(target_data)
+            utils.validate(instance=target_data, schema=target_schema)
+
+            # Add generated extra keys that not available in the YAML
+            target_id = target_data['id']
+
+            # Check if a target with same ID already exists
+            # exit with error, otherwise, we would override the previous one and that would go unnoticed.
+            if target_id in targets:
+                config.logger.error('Duplicate target found "%s"', target_id)
+                sys.exit(1)
+
+            target_data['files'] = config.get_connector_files(
+                config.get_target_dir(target_id)
+            )
+            target_data['taps'] = []
+
+            # Add target to list
+            targets[target_id] = target_data
+
+        # Load every tap yaml into targets dictionary
+        for yaml_file in tap_yamls:
+            config.logger.info('LOADING TAP: %s', yaml_file)
+            tap_data = utils.load_yaml(os.path.join(yaml_dir, yaml_file), vault_secret)
+            cls.validate_tap_table_format_placement(tap_data)
+            cls.validate_native_to_iceberg_conversion_placement(tap_data, 'Tap')
+            cls._validate_tap_query_history_poll_timeout_placement(tap_data)
+            utils.validate(instance=tap_data, schema=tap_schema)
+
+            tap_id = tap_data['id']
+
+            # Check if a tap with same ID already exists
+            # exit with error, otherwise, we would override the previous one and that would go unnoticed.
+            if tap_id in taps:
+                config.logger.error('Duplicate tap found "%s"', tap_id)
+                sys.exit(1)
+
+            target_id = tap_data['target']
+            if target_id not in targets:
+                config.logger.error(
+                    "Can't find the target with the ID \"%s\" but it's referenced in %s",
+                    target_id,
+                    yaml_file,
+                )
+                sys.exit(1)
+
+            cls.validate_target_table_format(tap_data, targets[target_id])
+            cls.validate_native_to_iceberg_conversion(tap_data, targets[target_id])
+            cls.validate_snowflake_decimal_versioning(tap_data, targets[target_id])
+            cls.validate_source_transformations(tap_data, targets[target_id])
+            cls.validate_yugabyte_log_based_port(tap_data)
+            cls.validate_yugabyte_route(tap_data, targets[target_id])
+
+            # Add generated extra keys that not available in the YAML
+            tap_data['files'] = config.get_connector_files(
+                config.get_tap_dir(target_id, tap_id)
+            )
+
+            # Add tap to list
+            taps[tap_id] = tap_data
+
+        # Link taps to targets
+        for target_key, target in targets.items():
+            target['taps'] = [
+                tap for tap in taps.values() if tap['target'] == target_key
+            ]
+
+        # Final structure is ready
+        config.targets = targets
+
+        return config
+
+    def get_temp_dir(self):
+        """
+        Returns the tap specific temp directory
+        """
+        return os.path.join(self.config_dir, 'tmp')
+
+    def get_data_diff_definitions(self, selected_taps=None):
+        """Return validated data-diff definitions from the loaded YAML model."""
+        return extract_check_definitions(
+            self.global_config,
+            self.targets,
+            selected_taps,
+        )
+
+    def get_scheduled_job_definitions(self):
+        """Validate scheduled job definitions. Placeholder for future scheduling features."""
+        return []
+
+    def get_target_dir(self, target_id):
+        """
+        Returns the absolute path of a target configuration directory
+        """
+        return os.path.join(self.config_dir, target_id)
+
+    def get_tap_dir(self, target_id, tap_id):
+        """
+        Returns the absolute path of a tap configuration directory
+        """
+        return os.path.join(self.config_dir, target_id, tap_id)
+
+    @staticmethod
+    def get_connector_files(connector_dir: str) -> Dict:
+        """
+        Returns the absolute paths of a tap/target configuration files
+        """
+        return {
+            'config': os.path.join(connector_dir, 'config.json'),
+            'inheritable_config': os.path.join(
+                connector_dir, 'inheritable_config.json'
+            ),
+            'properties': os.path.join(connector_dir, 'properties.json'),
+            'state': os.path.join(connector_dir, 'state.json'),
+            'transformation': os.path.join(connector_dir, 'transformation.json'),
+            'selection': os.path.join(connector_dir, 'selection.json'),
+            'pidfile': os.path.join(connector_dir, 'pipelinewise.pid'),
+        }
+
+    @staticmethod
+    def get_connector_config_file(connector_dir: str) -> str:
+        """
+        Returns the absolute path of a tap configuration file
+        Args:
+            connector_dir: the absolute path of the connector
+        """
+        return os.path.join(connector_dir, 'config.json')
+
+    def save(self, selected_taps: Union[None, List] = None):
+        """
+        Generating pipelinewise configuration directory layout on the disk.
+
+        The pipelinewise configuration is a group of JSON files organised
+        into a common directory structure and usually deployed into
+        ~/.pipelinewise
+        """
+        selected_taps_list = selected_taps if selected_taps else ['*']
+        self.logger.info('SAVING CONFIG')
+        self.save_main_config_json()
+
+        # Save every target config json
+        for target in self.targets.values():
+            self.save_target_jsons(target)
+
+            # Save every tap JSON files
+            for tap in target['taps']:
+                if tap['id'] in selected_taps_list or selected_taps_list == ['*']:
+                    extra_config_keys = utils.get_tap_extra_config_keys(
+                        tap, self.get_temp_dir()
+                    )
+                    self.save_tap_jsons(target, tap, extra_config_keys)
+
+    def save_main_config_json(self):
+        """
+        Generating pipelinewise main config.json file
+
+        This is in the main config directory, usually at ~/.pipelinewise/config.json
+        and has the list of targets and its taps with some basic information.
+        """
+        self.logger.info('SAVING MAIN CONFIG JSON to %s', self.config_path)
+        targets = []
+
+        # Generate dictionary for config.json
+        for target_tuple in self.targets.items():
+            target = target_tuple[1]
+            taps = []
+            for tap in target.get('taps'):
+                tap_setting = {
+                        'id': tap.get('id'),
+                        'name': tap.get('name'),
+                        'type': tap.get('type'),
+                        'owner': tap.get('owner'),
+                        'stream_buffer_size': tap.get('stream_buffer_size'),
+                        'send_alert': tap.get('send_alert', True),
+                        'enabled': True,
+                    }
+                for key in (
+                    'target_table_format',
+                    'iceberg_version',
+                    self.VERSION_LEGACY_FLOAT_COLUMNS_SETTING,
+                    self.NATIVE_TO_ICEBERG_CONVERSION,
+                ):
+                    if key in tap:
+                        tap_setting[key] = tap[key]
+                if tap.get('slack_alert_channel'):
+                    tap_setting['slack_alert_channel'] = tap['slack_alert_channel']
+                taps.append(tap_setting)
+
+            targets.append(
+                {
+                    'id': target.get('id'),
+                    'name': target.get('name'),
+                    'status': 'ready',
+                    'type': target.get('type'),
+                    'taps': taps,
+                }
+            )
+        main_config = {**self.global_config, **{'targets': targets}}
+
+        # Create config dir if not exists
+        if not os.path.exists(self.config_dir):
+            os.mkdir(self.config_dir)
+
+        # Save to JSON
+        utils.save_json(main_config, self.config_path)
+
+    def save_target_jsons(self, target):
+        """
+        Generating JSON config files for a singer target connector:
+            1. config.json             :(Singer spec):  Tap connection details
+        """
+        target_dir = self.get_target_dir(target.get('id'))
+        target_config_path = os.path.join(target_dir, 'config.json')
+        self.logger.info('SAVING TARGET JSONS to %s', target_config_path)
+
+        # Create target dir if not exists
+        if not os.path.exists(target_dir):
+            os.mkdir(target_dir)
+
+        # Save target config.json
+        utils.save_json(target.get('db_conn'), target_config_path)
+
+    def save_tap_jsons(self, target, tap, extra_config_keys=None):
+        """
+        Generating JSON config files for a singer tap connector:
+            1. config.json             :(Singer spec):  Tap connection details
+
+            4. selection.json          :(Pipelinewise): List of streams/tables to replicate
+            5. inheritable_config.json :(Pipelinewise): Extra config keys for the linked
+                                                        singer target connector that
+                                                        pipelinewise will pass at run time
+            6. transformation.json     :(Pipelinewise): Column transformations between the
+                                                        tap and target
+        """
+        if extra_config_keys is None:
+            extra_config_keys = {}
+
+        # Generate tap config dict
+        tap_config = self.generate_tap_connection_config(tap, extra_config_keys, target.get('type'))
+
+        # Generate tap selection
+        tap_selection = {'selection': self.generate_selection(tap)}
+
+        # Generate tap transformation
+        tap_transformation = {'transformations': self.generate_transformations(tap)}
+
+        # Generate tap inheritable_config dict
+        tap_inheritable_config = self.generate_inheritable_config(tap, target.get('type'))
+
+        tap_dir = self.get_tap_dir(target.get('id'), tap.get('id'))
+        self.logger.info('SAVING TAP JSONS to %s', tap_dir)
+
+        # Define tap JSON file paths
+        tap_config_path = os.path.join(tap_dir, 'config.json')
+        tap_selection_path = os.path.join(tap_dir, 'selection.json')
+        tap_transformation_path = os.path.join(tap_dir, 'transformation.json')
+        tap_inheritable_config_path = os.path.join(tap_dir, 'inheritable_config.json')
+
+        # Create tap dir if not exists
+        if not os.path.exists(tap_dir):
+            os.mkdir(tap_dir)
+
+        # Save the generated JSON files
+        utils.save_json(tap_config, tap_config_path)
+        utils.save_json(tap_inheritable_config, tap_inheritable_config_path)
+        utils.save_json(tap_transformation, tap_transformation_path)
+        utils.save_json(tap_selection, tap_selection_path)
+
+    @classmethod
+    def generate_tap_connection_config(cls, tap: Dict, extra_config_keys: Dict, target_type=None) -> Dict:
+        """
+        Generate tap connection config which is a merged dictionary of db_connection and optional extra_keys
+        Args:
+            tap: tap config
+            extra_config_keys:  extra keys to add to the db conn config
+            target_type: destination connector used to enable exact decimal transport
+        Returns: Dictionary of tap connection config
+        """
+        tap_config = {**tap.get('db_conn'), **extra_config_keys}
+        tap_config.pop('decimal_target', None)
+        if tap.get('type') in ('tap-mysql', 'tap-postgres', 'tap-yugabyte') and target_type in (
+            'target-snowflake', 'target-postgres',
+        ):
+            tap_config['decimal_target'] = target_type.removeprefix('target-')
+        if (
+            tap.get('type') == 'tap-mysql'
+            and tap.get('target_table_format') == cls.TABLE_FORMAT_ICEBERG
+        ):
+            tap_config.update(
+                target_table_format=tap['target_table_format'],
+                iceberg_version=tap['iceberg_version'],
+            )
+        return tap_config
+
+    @classmethod
+    def generate_selection(cls, tap: Dict) -> List[Dict]:
+        """
+        Generate the selection data which is the list of selected streams and their replication method
+        Args:
+            tap: the tap config dictionary
+
+        Returns: List of dictionaries of selected streams
+        """
+        selection = []
+
+        for schema in tap.get('schemas', []):
+            schema_name = schema.get('source_schema')
+            for table in schema.get('tables', []):
+                table_name = table.get('table_name')
+                sync_start_from = table.get('sync_start_from')
+                replication_method = table.get(
+                    'replication_method', utils.get_tap_default_replication_method(tap)
+                )
+                selection.append(
+                    utils.delete_empty_keys(
+                        {
+                            'tap_stream_id': utils.get_tap_stream_id(
+                                tap, tap['db_conn'].get('dbname'), schema_name, table_name
+                            ),
+                            'replication_method': replication_method,
+                            # Add replication_key only if replication_method is INCREMENTAL
+                            'replication_key': table.get('replication_key')
+                            if replication_method == 'INCREMENTAL' else None,
+                            'sync_start_from': sync_start_from
+                            if sync_start_from else None
+                        }
+                    )
+                )
+
+        return selection
+
+    @classmethod
+    def validate_yugabyte_route(cls, tap: Dict, target: Dict) -> None:
+        """Reject tap-yugabyte routes where nothing creates the LOG_BASED replication slot.
+
+        Only FastSync creates the slot. Without it, LOG_BASED fails with "Unable to find replication slot" on its
+        second run, and the unfiltered fast_sync that would recreate it is unavailable.
+        """
+        if tap.get('type') != 'tap-yugabyte':
+            return
+        if tap.get('target_table_format') == cls.TABLE_FORMAT_ICEBERG:
+            raise InvalidConfigException(
+                f'Tap "{tap.get("id")}" uses target_table_format "iceberg". YugabyteDB does not support managed '
+                'Iceberg targets yet. Remove target_table_format or set it to "native".'
+            )
+        capabilities = fastsync_capabilities.resolve_fastsync_capabilities(
+            tap['type'], target['type'], tap.get('target_table_format'),
+        )
+        if capabilities.full_sync:
+            return
+        default_replication_method = utils.get_tap_default_replication_method(tap)
+        log_based_tables = [
+            f'{schema.get("source_schema")}.{table.get("table_name")}'
+            for schema in tap.get('schemas', [])
+            for table in schema.get('tables', [])
+            if table.get('replication_method', default_replication_method) == 'LOG_BASED'
+        ]
+        if log_based_tables:
+            raise InvalidConfigException(
+                f'Tap "{tap.get("id")}" uses LOG_BASED replication for {", ".join(log_based_tables)} with target '
+                f'"{target.get("id")}" ({target["type"]}). YugabyteDB LOG_BASED needs FastSync to create its '
+                'replication slot, and this target has no FastSync route. Use FULL_TABLE or INCREMENTAL for these '
+                'tables.'
+            )
+
+    @classmethod
+    def validate_yugabyte_log_based_port(cls, tap: Dict) -> None:
+        """Reject LOG_BASED tap-yugabyte tables on a port the current YugabyteDB drivers cannot replicate from."""
+        port = tap.get('db_conn', {}).get('port')
+        if tap.get('type') != 'tap-yugabyte' or str(port) == str(cls.YUGABYTE_REPLICATION_PORT):
+            return
+        default_replication_method = utils.get_tap_default_replication_method(tap)
+        log_based_tables = [
+            f'{schema.get("source_schema")}.{table.get("table_name")}'
+            for schema in tap.get('schemas', [])
+            for table in schema.get('tables', [])
+            if table.get('replication_method', default_replication_method) == 'LOG_BASED'
+        ]
+        if log_based_tables:
+            raise InvalidConfigException(
+                f'Tap "{tap.get("id")}" uses LOG_BASED replication for {", ".join(log_based_tables)} on port '
+                f'{port}. LOG_BASED requires port {cls.YUGABYTE_REPLICATION_PORT}: the current YugabyteDB '
+                'psycopg2 drivers (psycopg2-yugabytedb-binary 2.9.3.5 and 2.9.3.5.post1) always open replication '
+                f'connections on port {cls.YUGABYTE_REPLICATION_PORT}. Connect on port '
+                f'{cls.YUGABYTE_REPLICATION_PORT}, or use FULL_TABLE or INCREMENTAL for these tables.'
+            )
+
+    @classmethod
+    def validate_source_transformations(cls, tap: Dict, target: Dict) -> None:
+        """Validate source-select rules before either validate or import discovers columns."""
+        if target['type'] != 'target-snowflake' or tap['type'] not in {'tap-mysql', 'tap-postgres', 'tap-yugabyte'}:
+            return
+        capabilities = fastsync_capabilities.resolve_fastsync_capabilities(
+            tap['type'], target['type'], tap.get('target_table_format'),
+        )
+        if not capabilities.available:
+            return
+        transformation_config = {'transformations': cls.generate_transformations(tap)}
+        default_replication_method = utils.get_tap_default_replication_method(tap)
+        for schema in tap.get('schemas', []):
+            for table in schema.get('tables', []):
+                table_name = f'{schema["source_schema"]}.{table["table_name"]}'
+                try:
+                    validate_source_transformation_config(table_name, transformation_config)
+                    if table.get('replication_method', default_replication_method) == 'INCREMENTAL':
+                        validate_bookmark_column(table_name, table.get('replication_key'), transformation_config)
+                except UnsupportedSourceTransformation as exc:
+                    raise InvalidTransformationException(
+                        f'Invalid source transformation for tap {tap["id"]!r}, table {table_name!r}: {exc}'
+                    ) from exc
+
+    @classmethod
+    def generate_transformations(cls, tap: Dict) -> List[Dict]:
+        """
+        Generate the transformations data from the given tap config
+        Args:
+            tap: the tap config dictionary
+
+        Returns: List of transformations
+        """
+        transformations = []
+
+        for schema in tap.get('schemas', []):
+            schema_name = schema.get('source_schema')
+            for table in schema.get('tables', []):
+                table_name = table.get('table_name')
+                for trans in table.get('transformations', []):
+                    transformations.append(
+                        {
+                            'tap_stream_name': utils.get_tap_stream_name(
+                                tap, tap['db_conn'].get('dbname'), schema_name, table_name),
+                            'field_id': trans['column'],
+                            # Make column name safe by wrapping it in quotes, it's useful when a field_id is a reserved
+                            # word to be used by target snowflake in fastsync
+                            'safe_field_id': safe_column_name(trans['column']),
+                            'field_paths': trans.get('field_paths'),
+                            'type': trans['type'],
+                            'when': trans.get('when'),
+                        }
+                    )
+
+        return transformations
+
+    def generate_inheritable_config(self, tap: Dict, target_type: str = None) -> Dict:
+        """
+        Generate the inheritable config which is the custom config that should be fed to the target at runtime
+        Args:
+            tap: tap config
+
+        Returns: Dictionary of config
+        """
+        schema_mapping = {}
+
+        for schema in tap.get('schemas', []):
+            source_schema = schema.get('source_schema')
+            target_schema = schema.get('target_schema')
+            target_schema_select_perms = schema.get(
+                'target_schema_select_permissions', []
+            )
+
+            schema_mapping[source_schema] = {
+                'target_schema': target_schema,
+                'target_schema_select_permissions': target_schema_select_perms,
+            }
+
+            # Schema mapping can include list of indices to create. Some target components
+            # like target-postgres create indices automatically
+            indices = {}
+            for table in schema.get('tables', []):
+                table_name = table.get('table_name')
+                table_indices = table.get('indices')
+                if table_indices:
+                    indices[table_name] = table_indices
+
+            # Add indices map to schema mapping
+            if indices:
+                schema_mapping[source_schema]['indices'] = indices
+
+        # Generate tap inheritable_config dict
+        tap_inheritable_config = utils.delete_empty_keys(
+            {
+                'temp_dir': self.get_temp_dir(),
+                'tap_id': tap.get('id'),
+                # Targets need source identity for legacy MySQL keys and PostgreSQL NaN keys.
+                'source_tap_type': (
+                    tap.get('type') if (
+                        tap.get('type') == 'tap-mysql' and target_type in ('target-snowflake', 'target-postgres')
+                        or tap.get('type') == 'tap-postgres' and target_type == 'target-snowflake'
+                    )
+                    else None
+                ),
+                'query_tag': json.dumps(
+                    {
+                        'ppw_component': tap.get('type'),
+                        'tap_id': tap.get('id'),
+                        'database': '{{database}}',
+                        'schema': '{{schema}}',
+                        'table': '{{table}}',
+                    }
+                ),
+                'batch_size_rows': tap.get('batch_size_rows', 20000),
+                'batch_wait_limit_seconds': tap.get('batch_wait_limit_seconds', None),
+                'parallelism': tap.get('parallelism', 0),
+                'parallelism_max': tap.get('parallelism_max', 4),
+                'flush_all_streams': tap.get('flush_all_streams', True),
+                'primary_key_required': tap.get('primary_key_required', True),
+                'default_target_schema': tap.get('default_target_schema'),
+                'default_target_schema_select_permissions': tap.get(
+                    'default_target_schema_select_permissions'
+                ),
+                'schema_mapping': schema_mapping,
+                # data_flattening_max_level
+                # -------------------------
+                #
+                # 'data_flattening_max_level' is an optional parameter in some target connectors that specifies
+                # how to load nested object into destination.
+                #
+                # We can load the original object represented as JSON or string (data flattening off) or we can
+                # flatten the schema and data by creating columns automatically. When 'data_flattening_max_level'
+                # is set to 0 then flattening functionality is turned off.
+                #
+                # The value can be set in multiple place and evaluated in the following order:
+                # ------------
+                #   1: First we try to find it in the tap YAML
+                #   2: Second we try to get the tap type specific default value
+                #   3: Otherwise we set flattening level to 0 (disabled)
+                'data_flattening_max_level': tap.get(
+                    'data_flattening_max_level',
+                    utils.get_tap_property(tap, 'default_data_flattening_max_level') or 0,
+                    ),
+                'validate_records': tap.get('validate_records', False),
+                'add_metadata_columns': tap.get('add_metadata_columns', False),
+                'split_large_files': tap.get('split_large_files', False),
+                'split_file_chunk_size_mb': tap.get('split_file_chunk_size_mb', 1000),
+                'split_file_max_chunks': tap.get('split_file_max_chunks', 20),
+                'archive_load_files': tap.get('archive_load_files', False),
+                'archive_load_files_s3_bucket': tap.get(
+                    'archive_load_files_s3_bucket', None
+                ),
+                'archive_load_files_s3_prefix': tap.get(
+                    'archive_load_files_s3_prefix', None
+                ),
+                'target_table_format': tap.get('target_table_format'),
+                'iceberg_version': tap.get('iceberg_version'),
+                self.VERSION_LEGACY_FLOAT_COLUMNS_SETTING: (
+                    tap.get(self.VERSION_LEGACY_FLOAT_COLUMNS_SETTING, False)
+                    if target_type == 'target-snowflake'
+                    and tap.get('type') in {'tap-mysql', 'tap-postgres'}
+                    else None
+                ),
+            }
+        )
+
+        return tap_inheritable_config
+
+    @classmethod
+    def validate_snowflake_decimal_versioning_placement(cls, target: Dict) -> None:
+        """Keep the per-tap decimal migration choice out of shared targets."""
+        if not isinstance(target, dict):
+            return
+        connection = target.get('db_conn')
+        if cls.VERSION_LEGACY_FLOAT_COLUMNS_SETTING in target or (
+            isinstance(connection, dict)
+            and cls.VERSION_LEGACY_FLOAT_COLUMNS_SETTING in connection
+        ):
+            raise InvalidConfigException(
+                f'Target "{target.get("id")}" cannot set '
+                f'{cls.VERSION_LEGACY_FLOAT_COLUMNS_SETTING}. Configure it on each '
+                'MariaDB, MySQL, or PostgreSQL tap that writes to Snowflake.'
+            )
+
+    @classmethod
+    def validate_snowflake_decimal_versioning(cls, tap: Dict, target: Dict) -> None:
+        """Limit the opt-in migration to supported SQL-to-Snowflake routes."""
+        setting = cls.VERSION_LEGACY_FLOAT_COLUMNS_SETTING
+        connection = tap.get('db_conn')
+        if isinstance(connection, dict) and setting in connection:
+            raise InvalidConfigException(
+                f'Tap "{tap.get("id")}" must configure {setting} at the tap root.'
+            )
+        if setting not in tap:
+            return
+        if target.get('type') != 'target-snowflake':
+            raise InvalidConfigException(
+                f'Tap "{tap.get("id")}" sets {setting}, but target '
+                f'"{target.get("id")}" is not target-snowflake.'
+            )
+        if tap.get('type') not in {'tap-mysql', 'tap-postgres'}:
+            raise InvalidConfigException(
+                f'Tap "{tap.get("id")}" sets {setting}, but only MariaDB, MySQL, '
+                'and PostgreSQL sources support this option.'
+            )
+
+    @classmethod
+    def validate_target_table_format_placement(cls, target: Dict) -> None:
+        """Reject table-format settings from a shared target definition."""
+        if not isinstance(target, dict):
+            return
+
+        root_settings = sorted(cls.TARGET_FORMAT_KEYS.intersection(target))
+        target_connection = target.get('db_conn')
+        connection_settings = sorted(
+            cls.TARGET_FORMAT_KEYS.intersection(target_connection)
+            if isinstance(target_connection, dict)
+            else []
+        )
+        if not root_settings and not connection_settings:
+            return
+
+        placements = []
+        if root_settings:
+            placements.append(
+                'target root: ' + ', '.join(f'"{key}"' for key in root_settings)
+            )
+        if connection_settings:
+            placements.append(
+                'db_conn: ' + ', '.join(
+                    f'"{key}"' for key in connection_settings
+                )
+            )
+        guidance = (
+            'Configure target_table_format and iceberg_version on each tap.'
+        )
+        if 'iceberg_create' in root_settings + connection_settings:
+            guidance += ' iceberg_create is no longer supported.'
+        raise InvalidConfigException(
+            f'Target "{target.get("id")}" cannot set table-format settings at '
+            f'{"; ".join(placements)}. {guidance}'
+        )
+
+    @staticmethod
+    def validate_snowflake_query_history_poll_timeout(target: Dict) -> None:
+        """Require an exact positive integer for the Snowflake recovery budget."""
+        if not isinstance(target, dict):
+            return
+        setting = 'iceberg_query_history_poll_timeout_seconds'
+        if setting in target:
+            raise InvalidConfigException(
+                f'Target "{target.get("id")}" cannot set {setting} at the target '
+                'root. Configure it in the target-snowflake db_conn.'
+            )
+        connection = target.get('db_conn')
+        if not isinstance(connection, dict):
+            return
+        if setting not in connection:
+            return
+        value = connection[setting]
+        if (
+            target.get('type') != 'target-snowflake'
+            or not isinstance(value, int)
+            or isinstance(value, bool)
+            or value <= 0
+        ):
+            raise InvalidConfigException(
+                f'Target "{target.get("id")}" {setting} must be a positive integer '
+                'for target-snowflake.'
+            )
+
+    @staticmethod
+    def _validate_tap_query_history_poll_timeout_placement(tap: Dict) -> None:
+        """Reject the target-owned recovery budget from tap configuration."""
+        if not isinstance(tap, dict):
+            return
+        setting = 'iceberg_query_history_poll_timeout_seconds'
+        connection = tap.get('db_conn')
+        placements = []
+        if setting in tap:
+            placements.append('tap root')
+        if isinstance(connection, dict) and setting in connection:
+            placements.append('tap db_conn')
+        if placements:
+            raise InvalidConfigException(
+                f'Tap "{tap.get("id")}" cannot set {setting} at '
+                f'{" or ".join(placements)}. Configure it in the '
+                'target-snowflake db_conn.'
+            )
+
+    @classmethod
+    def validate_tap_table_format_placement(cls, tap: Dict) -> None:
+        """Reject legacy or misplaced table-format settings from a tap definition."""
+        if not isinstance(tap, dict):
+            return
+
+        root_settings = ['iceberg_create'] if 'iceberg_create' in tap else []
+        tap_connection = tap.get('db_conn')
+        connection_settings = sorted(
+            cls.TARGET_FORMAT_KEYS.intersection(tap_connection)
+            if isinstance(tap_connection, dict)
+            else []
+        )
+        if not root_settings and not connection_settings:
+            return
+
+        placements = []
+        if root_settings:
+            placements.append('tap root: "iceberg_create"')
+        if connection_settings:
+            placements.append(
+                'db_conn: ' + ', '.join(
+                    f'"{key}"' for key in connection_settings
+                )
+            )
+        guidance = (
+            'Configure target_table_format and iceberg_version at the tap root.'
+        )
+        if 'iceberg_create' in root_settings + connection_settings:
+            guidance += ' iceberg_create is no longer supported.'
+        raise InvalidConfigException(
+            f'Tap "{tap.get("id")}" cannot set table-format settings at '
+            f'{"; ".join(placements)}. {guidance}'
+        )
+
+    @classmethod
+    def validate_target_table_format(cls, tap: Dict, target: Dict) -> None:
+        """Validate tap-level table format against its target configuration."""
+        cls.validate_tap_table_format_placement(tap)
+
+        table_format = tap.get('target_table_format')
+        iceberg_version_is_set = 'iceberg_version' in tap
+        iceberg_version = tap.get('iceberg_version')
+
+        if table_format is None:
+            if iceberg_version_is_set:
+                raise InvalidConfigException(
+                    f'Tap "{tap.get("id")}" sets iceberg_version without target_table_format.'
+                )
+            return
+
+        if table_format not in {cls.TABLE_FORMAT_NATIVE, cls.TABLE_FORMAT_ICEBERG}:
+            raise InvalidConfigException(
+                f'Tap "{tap.get("id")}" has unsupported target_table_format "{table_format}".'
+            )
+
+        if table_format == cls.TABLE_FORMAT_ICEBERG:
+            if (
+                not isinstance(iceberg_version, int)
+                or isinstance(iceberg_version, bool)
+                or iceberg_version != cls.ICEBERG_VERSION
+            ):
+                raise InvalidConfigException(
+                    f'Tap "{tap.get("id")}" must set iceberg_version to integer 3 '
+                    'with target_table_format "iceberg".'
+                )
+        elif iceberg_version_is_set:
+            raise InvalidConfigException(
+                f'Tap "{tap.get("id")}" cannot set iceberg_version with '
+                'target_table_format "native".'
+            )
+
+        if target.get('type') != 'target-snowflake':
+            raise InvalidConfigException(
+                f'Tap "{tap.get("id")}" sets target_table_format but target '
+                f'"{target.get("id")}" is not target-snowflake.'
+            )
+
+        if table_format == cls.TABLE_FORMAT_ICEBERG:
+            cls._validate_iceberg_tap_settings(tap, target)
+
+    @classmethod
+    def validate_native_to_iceberg_conversion_placement(cls, connector: Dict, kind: str) -> None:
+        """Keep automatic conversion on the tap whose tables it converts, away from targets."""
+        if not isinstance(connector, dict):
+            return
+        setting = cls.NATIVE_TO_ICEBERG_CONVERSION
+        placements = []
+        if kind == 'Target' and setting in connector:
+            placements.append('target root')
+        connection = connector.get('db_conn')
+        if isinstance(connection, dict) and setting in connection:
+            placements.append(f'{kind.lower()} db_conn')
+        if placements:
+            raise InvalidConfigException(
+                f'{kind} "{connector.get("id")}" cannot set {setting} at '
+                f'{" or ".join(placements)}. Configure it at the root of each Iceberg tap.'
+            )
+
+    @classmethod
+    def validate_native_to_iceberg_conversion(cls, tap: Dict, target: Dict) -> None:
+        """Allow automatic conversion only where both writers accept the converted tables."""
+        setting = cls.NATIVE_TO_ICEBERG_CONVERSION
+        if setting not in tap:
+            return
+        conversion = tap[setting]
+        if (
+            not isinstance(conversion, dict)
+            or not isinstance(conversion.get('enabled'), bool)
+            or set(conversion) - {'enabled', 'conversion_warehouse'}
+        ):
+            raise InvalidConfigException(
+                f'Tap "{tap.get("id")}" {setting} must be an object with a Boolean '
+                '"enabled" and an optional "conversion_warehouse".'
+            )
+        conversion_warehouse = conversion.get('conversion_warehouse')
+        if 'conversion_warehouse' in conversion and (
+            not isinstance(conversion_warehouse, str) or not conversion_warehouse.strip()
+        ):
+            raise InvalidConfigException(
+                f'Tap "{tap.get("id")}" {setting} conversion_warehouse must be a non-empty string.'
+            )
+        if not conversion['enabled']:
+            return
+        if (
+            target.get('type') != 'target-snowflake'
+            or tap.get('target_table_format') != cls.TABLE_FORMAT_ICEBERG
+        ):
+            raise InvalidConfigException(
+                f'Tap "{tap.get("id")}" enables {setting}, which requires '
+                'target_table_format "iceberg", iceberg_version 3, and a '
+                'target-snowflake target.'
+            )
+        if cls._effective_flattening_level(tap) != 0:
+            raise InvalidConfigException(
+                f'Tap "{tap.get("id")}" enables {setting}, which requires '
+                'data_flattening_max_level: 0.'
+            )
+
+    @staticmethod
+    def _effective_flattening_level(tap: Dict):
+        level = tap.get('data_flattening_max_level')
+        if level is None:
+            level = utils.get_tap_property(tap, 'default_data_flattening_max_level') or 0
+        return None if isinstance(level, bool) else level
+
+    @classmethod
+    def _validate_iceberg_tap_settings(cls, tap: Dict, target: Dict) -> None:
+        """Validate tap settings supported by explicit Singer and FastSync Iceberg routes."""
+        capabilities = fastsync_capabilities.resolve_fastsync_capabilities(
+            tap['type'],
+            target['type'],
+            tap.get('target_table_format'),
+        )
+        if not capabilities.available:
+            return
+
+        if cls._effective_flattening_level(tap) != 0:
+            raise InvalidConfigException(
+                f'Tap "{tap.get("id")}" must use data_flattening_max_level: 0 '
+                'with target_table_format "iceberg".'
+            )

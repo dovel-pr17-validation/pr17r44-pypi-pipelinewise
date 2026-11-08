@@ -1,0 +1,936 @@
+
+.. _troubleshooting:
+
+Troubleshooting
+===============
+
+Start with the exact failing log line, connector versions, last acknowledged
+state, and source/target errors from the same UTC interval. Do not resync or edit
+state until the unavailable boundary has been identified.
+
+
+Symptom index
+-------------
+
+.. list-table::
+   :header-rows: 1
+   :widths: 42 28 30
+   :width: 100%
+
+   * - Symptom
+     - Area
+     - First check
+   * - :ref:`Lost connection <troubleshooting_mysql_lost_connection>` or
+       :ref:`max_allowed_packet <troubleshooting_mysql_max_allowed_packet>`
+     - MariaDB / MySQL
+     - Session timeouts and packet limits.
+   * - :ref:`Missing <troubleshooting_mysql_missing_binlog>` or
+       :ref:`corrupt binlog <troubleshooting_mysql_bogus_log_event>`
+     - MariaDB / MySQL LOG_BASED
+     - Source retention and saved binlog position.
+   * - :ref:`wal_level <troubleshooting_postgres_wal_level>` or
+       :ref:`missing slot <troubleshooting_postgres_missing_slot>`
+     - PostgreSQL LOG_BASED
+     - Primary configuration and slot existence.
+   * - :ref:`PGRES_COPY_BOTH <troubleshooting_postgres_pgres_copy_both>`
+     - PostgreSQL LOG_BASED
+     - Source logs, network, timeout, and target backpressure.
+   * - :ref:`stream_abort_cb callback missing
+       <troubleshooting_postgres_stream_abort_callback>`
+     - PostgreSQL LOG_BASED
+     - ``logical_decoding_work_mem`` and large or concurrent transactions.
+   * - :ref:`LOG_BASED throughput falls behind without errors
+       <troubleshooting_postgres_logical_decoding_spill>`
+     - PostgreSQL LOG_BASED
+     - Logical-decoding disk spill and ``logical_decoding_work_mem``.
+   * - :ref:`Recovery conflict <troubleshooting_postgres_recovery_conflict>`
+     - PostgreSQL replica reads
+     - Standby replay delay settings.
+   * - :ref:`Table not found <troubleshooting_fastsync_table_not_found>` or
+       :ref:`zero discovered tables <troubleshooting_discovery_zero_tables>`
+     - Discovery / FastSync
+     - Source name and replication-user permissions.
+   * - :ref:`Iceberg publication remains ambiguous
+       <troubleshooting_iceberg_publication>`
+     - Snowflake FastSync
+     - Recovery manifest, query tag, and Snowflake query history.
+   * - :ref:`Snowflake VARCHAR width is incompatible
+       <troubleshooting_snowflake_varchar_width>`
+     - Snowflake FastSync / Singer
+     - Physical column width and target-role DDL privileges.
+   * - :ref:`Native-to-Iceberg primary name is absent
+       <troubleshooting_iceberg_conversion_missing_primary>`
+     - Snowflake conversion
+     - Conversion manifest and ``_NATIVE`` / ``_ICEBERG`` companions.
+   * - :ref:`Native-to-Iceberg manifest cannot be read
+       <troubleshooting_iceberg_conversion_unreadable_manifest>`
+     - Snowflake conversion
+     - Conversion manifest and physical format of the primary and ``_ICEBERG``.
+   * - :ref:`Native-to-Iceberg contents changed after cutover
+       <troubleshooting_iceberg_conversion_contents_changed>`
+     - Snowflake conversion
+     - Promoted table, ``_NATIVE`` backup, and conversion manifest.
+   * - :ref:`Stale running log <troubleshooting_logging>`
+     - Process lifecycle
+     - PID file and complete process tree.
+
+
+Replication checks
+------------------
+
+See :ref:`replication_methods` for a detailed explanation of each replication method.
+
+.. warning::
+
+    MySQL, MariaDB, and PostgreSQL tables using ``INCREMENTAL`` or ``LOG_BASED``
+    replication must have a primary key by default. ``FULL_TABLE`` replication does
+    not have this requirement. PipelineWise validates this during import and reports
+    the affected stream before a run starts.
+
+.. _troubleshooting_when_to_resync:
+
+When to resync
+''''''''''''''
+
+* For **INCREMENTAL** replication you almost never need to resync, unless there
+  was data corruption or a large number of old rows were updated that need to
+  be replicated to the target.
+* For **LOG_BASED** MariaDB/MySQL, you need to resync if the source binlog is no
+  longer available.
+* For **LOG_BASED** PostgreSQL, you need to resync if the replication slot is no
+  longer available.
+
+.. _troubleshooting_incremental_missing_updates:
+
+INCREMENTAL method and missing updates
+''''''''''''''''''''''''''''''''''''''
+
+When using incremental replication, PipelineWise will miss new or updated records if
+the ``replication_key`` column is being back-filled (i.e. older rows are receiving
+new values for the replication key). Consider using ``LOG_BASED`` replication if
+you need to capture all changes.
+
+.. _troubleshooting_replica_host_resyncs:
+
+Using replica_host for large table resyncs (1 TB+)
+''''''''''''''''''''''''''''''''''''''''''''''''''
+
+Both MySQL and PostgreSQL taps support setting a ``replica_host`` key. When set,
+the initial FastSync will be done on the replica, reducing pressure on the primary
+database. Once the resync has completed, the tap will pick up the replication slot
+it created on the primary to continue replication.
+
+You can use this effectively with a partial sync (``sync_start_from``) to resync
+large tables and/or switch them to log-based replication.
+
+.. _troubleshooting_transformation_changes:
+
+Changes to transformations
+''''''''''''''''''''''''''
+
+Changes to transformations will only be applied to newly extracted data. If you need
+the transformation applied to existing data in the target, you will need to resync
+the affected tables.
+
+.. _troubleshooting_resync_size_limit:
+
+Resync table size limit
+'''''''''''''''''''''''
+
+For MySQL and PostgreSQL taps, ``fast_sync`` checks the size of non-partial-sync
+tables and will refuse to proceed if any table exceeds the configured
+``allowed_resync_max_size`` limit (see :ref:`resync`). Use ``fast_sync --force``
+to override this check.
+
+
+MariaDB / MySQL Errors
+''''''''''''''''''''''
+
+.. _troubleshooting_mysql_lost_connection:
+
+Lost connection to MySQL server (Errno 104, Connection reset by peer)
+"""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
+
+*Log message:*
+
+.. code-block:: text
+
+    pymysql.err.OperationalError: (2013, 'Lost connection to MySQL server
+    during query ([Errno 104] Connection reset by peer)')
+
+*Why it happens:*
+A large export or a slow target can exceed the source's network write timeout.
+Network interruptions, server restarts, and failovers can also break a connection.
+
+For Singer file/position binlog disconnects, PipelineWise retries from
+target-acknowledged state after 30 seconds, then after 60 seconds. The first
+two disconnects log warnings without tracebacks. A third disconnect fails the
+run with a traceback; unrelated errors are not suppressed.
+
+*How to fix:*
+PipelineWise applies its session defaults first, then runs configured
+``session_sqls``. Singer, FullSync, and PartialSync default to a one-hour
+``net_write_timeout``. If a longer blocked write is expected, override only
+that setting:
+
+.. code-block:: yaml
+
+    dbname: "your_database"
+    session_sqls:
+      - SET SESSION net_write_timeout=7200
+
+Statement timeouts are disabled automatically with MariaDB
+``max_statement_time=0`` or MySQL ``max_execution_time=0``. Use only the setting
+supported by the source engine when overriding it.
+
+.. _troubleshooting_mysql_utf8mb3:
+
+Unknown encoding: utf8mb3
+"""""""""""""""""""""""""
+
+*How to fix:*
+The tap cannot decode ``utf8mb3`` data. Identify the affected table or column, then
+work with your database administrator to test and convert its character set to a
+supported encoding such as ``utf8mb4``. A character-set conversion changes source
+data and should be tested before it is applied in production.
+
+.. _troubleshooting_mysql_bogus_log_event:
+
+Bogus data in log event
+"""""""""""""""""""""""
+
+*Why it happens:*
+The source server (OS or MySQL service) restarted unexpectedly, corrupting the
+current binlog position stored in PipelineWise state.
+
+*How to fix:*
+Run a full resync with
+``pipelinewise fast_sync --tap <tap_id> --target <target_id>``. See :ref:`resync`
+for the impact and available table-selection options.
+
+.. _troubleshooting_mysql_max_allowed_packet:
+
+Log event exceeded max_allowed_packet
+"""""""""""""""""""""""""""""""""""""
+
+*Log message:*
+
+.. code-block:: text
+
+    log event entry exceeded max_allowed_packet; Increase max_allowed_packet on master
+
+*How to fix:*
+Increase ``max_allowed_packet`` on the source server. If the problem persists after
+increasing the value, run a FastSync to rebuild the affected tables.
+
+.. _troubleshooting_mysql_missing_binlog:
+
+Missing binlog
+""""""""""""""
+
+*Log message:*
+
+.. code-block:: text
+
+    Exception: Unable to replicate binlog stream because the following
+    binary log(s) no longer exist: mysql-bin.000119
+
+*Why it happens:*
+The binary log files have been purged from the source server due to the binlog
+retention period.
+
+*How to fix:*
+
+1. Resync the affected tables. If the error recurs, the retention period may be
+   too low. You can check the current binlog files by running ``SHOW BINARY LOGS``
+   on the source.
+2. Ask your database administrator to increase the binlog retention period. You can
+   check the current setting with:
+
+   .. code-block:: sql
+
+       SHOW GLOBAL VARIABLES LIKE 'expire_logs_days';
+
+3. As a last resort, change the replication method from ``LOG_BASED`` to another method.
+
+.. _troubleshooting_mysql_state_position:
+
+Changing the binlog position in state.json
+""""""""""""""""""""""""""""""""""""""""""
+
+Prefer :ref:`cli_reset_state` for a controlled failover with an exact position
+mapping. If no supported mapping is available and manual recovery is unavoidable,
+stop the tap and back up the state first. Never edit a state file while its tap is
+running.
+
+.. code-block:: bash
+
+    $ pipelinewise stop_tap --tap <tap_id> --target <target_id>
+    $ cp state.json state.json.backup
+
+The following command previews a binlog filename change without modifying the file:
+
+.. code-block:: bash
+
+    $ sed -E 's/(mysql-bin-changelog\.)[0-9]+/\1#####/g' state.json
+
+Replace ``#####`` with the new binlog number. ``-E`` works with BSD/macOS and
+modern GNU ``sed``. To update both the filename and ``log_pos``, write the result
+to a new file rather than editing the state in place:
+
+.. code-block:: bash
+
+    $ sed -E \
+        -e 's/(mysql-bin-changelog\.)[0-9]+/\1#####/g' \
+        -e 's|("log_pos": )[0-9]+|\1#####|g' \
+        state.json > state.json.new
+
+Replace each ``#####`` with the intended value. Validate the new JSON before
+replacing the state file:
+
+.. code-block:: bash
+
+    $ python -m json.tool state.json.new > /dev/null
+    $ mv state.json.new state.json
+
+Keep ``state.json.backup`` until the next run succeeds. A wrong binlog filename or
+position can skip or duplicate data; use a full resync instead when the correct
+position is uncertain.
+
+
+PostgreSQL Errors
+'''''''''''''''''
+
+.. _troubleshooting_postgres_wal_level:
+
+requires wal_level >= logical
+"""""""""""""""""""""""""""""
+
+*Log message:*
+
+.. code-block:: text
+
+    {SCHEMA_NAME}.{TABLE_NAME}:logical decoding requires wal_level >= logical
+
+*Why it happens:*
+The PostgreSQL source database does not have logical replication enabled.
+
+*How to fix:*
+Set ``wal_level`` to ``logical`` on the source database. Note that changing the WAL
+level requires restarting the database instance. If the tap owner cannot tolerate a
+restart, consider changing the replication method to something other than ``LOG_BASED``.
+
+.. _troubleshooting_postgres_pgres_copy_both:
+
+PGRES_COPY_BOTH and no message from the libpq
+"""""""""""""""""""""""""""""""""""""""""""""
+
+*Log message:*
+
+.. code-block:: text
+
+    logger_name=tap_postgres log_level=CRITICAL message=error with status
+    PGRES_COPY_BOTH and no message from the libpq
+
+*Why it happens:*
+This libpq message says that the replication COPY connection ended without a more
+specific client-side error; it does not identify the cause. Possible causes include
+a PostgreSQL restart or termination, a network interruption,
+``wal_sender_timeout`` expiry, or delayed feedback while the target is blocked.
+Compare the PipelineWise, source PostgreSQL, and network logs from the same UTC
+interval before changing timeouts or state.
+
+*How to fix:*
+
+* **If the source or network terminated the connection,** correct that cause and
+  restart the same tap without advancing state.
+
+* **If the PostgreSQL log reports a sender timeout,** check the effective value:
+
+  .. code-block:: sql
+
+      SELECT name, setting, unit FROM pg_settings WHERE name = 'wal_sender_timeout';
+
+* **If target backpressure is confirmed, enable or increase
+  ``stream_buffer_size``.** This buffer decouples reading from loading. It cannot
+  compensate indefinitely for a blocked target or an unsuitable timeout, so fix
+  those causes first.
+
+.. _troubleshooting_postgres_stream_abort_callback:
+
+logical streaming requires a stream_abort_cb callback
+"""""""""""""""""""""""""""""""""""""""""""""""""""""
+
+*Log message:*
+
+.. code-block:: text
+
+    psycopg2.errors.ObjectNotInPrerequisiteState:
+    logical streaming requires a stream_abort_cb callback
+
+*Why it happens:*
+PostgreSQL can start streaming an in-progress transaction when decoded changes
+exceed ``logical_decoding_work_mem``. On affected PostgreSQL and wal2json
+combinations, aborting that transaction can expose a missing wal2json streaming
+callback and stop replication.
+
+*How to fix:*
+Work with the source database administrator to increase
+``logical_decoding_work_mem`` above the decoded working set of large or concurrent
+transactions. Use the incremental tuning and memory guidance in
+:ref:`troubleshooting_postgres_logical_decoding_spill`, then restart and retry the
+same tap so its replication connection receives the new value. Do not drop,
+recreate, or advance the slot; that can discard changes that PipelineWise has not
+acknowledged.
+
+.. _troubleshooting_postgres_logical_decoding_spill:
+
+LOG_BASED replication is slow or falling behind
+"""""""""""""""""""""""""""""""""""""""""""""""
+
+*Why it happens:*
+``logical_decoding_work_mem`` limits the memory used by each logical replication
+connection. When decoded changes exceed the limit,
+PostgreSQL writes them to local disk. A value that is too low for the source
+workload can therefore cause frequent disk spill and substantially reduce
+LOG_BASED throughput.
+
+Each active logical replication connection has its own buffer. A busy source, large
+or concurrent transactions, or several PipelineWise replications consuming slots
+on the same PostgreSQL cluster can increase both spill I/O and total memory demand.
+
+*How to diagnose:*
+Check the configured value:
+
+.. code-block:: sql
+
+    SELECT name, setting, unit, source
+    FROM pg_settings
+    WHERE name = 'logical_decoding_work_mem';
+
+On PostgreSQL 14 and later, compare the following counters over the period when
+replication is slow. Increasing ``spill_count`` or ``spill_bytes`` confirms that
+logical decoding is writing changes to disk; a large historical total alone does
+not prove a current bottleneck.
+
+.. code-block:: sql
+
+    SELECT slot_name,
+           spill_txns,
+           spill_count,
+           pg_size_pretty(spill_bytes) AS spill_bytes
+    FROM pg_stat_replication_slots
+    ORDER BY spill_bytes DESC;
+
+Check slot activity and acknowledgement separately. ``confirmed_flush_lsn`` is
+the position acknowledged by the consumer, while ``restart_lsn`` is the oldest
+WAL that may still be required. The calculated value approximates WAL retained
+for each slot:
+
+.. code-block:: sql
+
+    SELECT slot_name,
+           active,
+           confirmed_flush_lsn,
+           restart_lsn,
+           pg_size_pretty(
+               pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)::bigint
+           ) AS retained_wal
+    FROM pg_replication_slots
+    WHERE slot_type = 'logical'
+    ORDER BY slot_name;
+
+Sample these values over the same interval as the spill counters. An inactive
+slot identifies a disconnected consumer. A stationary ``confirmed_flush_lsn``
+shows that acknowledgement is not advancing, but does not by itself distinguish
+source decoding from target or network backpressure.
+
+See the PostgreSQL documentation for
+`logical_decoding_work_mem <https://www.postgresql.org/docs/current/runtime-config-resource.html#GUC-LOGICAL-DECODING-WORK-MEM>`_
+and
+`logical replication slot statistics <https://www.postgresql.org/docs/current/monitoring-stats.html#MONITORING-PG-STAT-REPLICATION-SLOTS-VIEW>`_.
+
+*How to fix:*
+Work with the source database administrator to increase the setting incrementally
+for the PipelineWise replication role and database. There is no universal value;
+test against the transaction sizes and concurrency of the source. For example:
+
+.. code-block:: sql
+
+    ALTER ROLE <replication_user> IN DATABASE <source_database>
+    SET logical_decoding_work_mem = '<tested_value>';
+
+Restart the tap after changing a role or database default so its replication
+connection receives the new value. Budget memory for every concurrent logical
+replication connection and monitor database memory and disk I/O while tuning.
+Increasing this setting reduces decoding spill; it does not fix target, network,
+or ``stream_buffer_size`` backpressure. Replication lag alone does not require a
+resync.
+
+.. _troubleshooting_postgres_recovery_conflict:
+
+Canceling statement due to conflict with recovery
+"""""""""""""""""""""""""""""""""""""""""""""""""
+
+*Log message:*
+
+.. code-block:: text
+
+    logger_name=tap_postgres log_level=CRITICAL message=terminating connection due to
+    conflict with recovery
+    DETAIL: User query might have needed to see row versions that must be removed.
+    HINT: In a moment you should be able to reconnect to the database and repeat your command.
+    SSL connection has been closed unexpectedly
+
+*Why it happens:*
+The replica has been set up with restrictive replay settings. You can check the current
+values with:
+
+.. code-block:: sql
+
+    SELECT name, setting, unit
+    FROM pg_settings
+    WHERE name IN ('max_standby_archive_delay', 'max_standby_streaming_delay');
+
+*How to fix:*
+Increase ``max_standby_streaming_delay`` on the replica.
+
+.. _troubleshooting_postgres_connection_closed:
+
+Connection already closed
+"""""""""""""""""""""""""
+
+*Log message:*
+
+.. code-block:: text
+
+    logger_name=tap_postgres log_level=CRITICAL message=connection already closed
+    psycopg2.OperationalError: SSL connection has been closed unexpectedly
+
+*Why it happens:*
+The source server is likely configured to kill idle connections.
+
+*How to fix:*
+Review the idle connection timeout settings on the source PostgreSQL server.
+
+.. _troubleshooting_postgres_recovery_in_progress:
+
+recovery is in progress
+"""""""""""""""""""""""
+
+*Log message:*
+
+.. code-block:: text
+
+    logger_name=tap_postgres log_level=CRITICAL message=recovery is in progress
+    HINT: WAL control functions cannot be executed during recovery.
+
+*Why it happens:*
+The tap is reading INCREMENTAL or FULL_TABLE replication from a replica. (LOG_BASED from a replica is not possible)
+
+*How to fix:*
+Point the tap at the primary server, or increase `max_standby_streaming_delay`.
+
+.. _troubleshooting_postgres_missing_slot:
+
+Unable to find replication slot
+"""""""""""""""""""""""""""""""
+
+*How to fix:*
+Run ``pipelinewise fast_sync --tap <tap_id> --target <target_id>`` with
+no ``--tables`` and the default ``--replication_method_only '*'`` to resync the
+whole tap and recreate its slot. Add ``--force`` only to bypass the resync size
+limit; ``sync_start_from`` remains effective either way. See
+:ref:`resync_postgres_slot_reset` for preflight checks, backups, and
+pending-Iceberg recovery before proceeding.
+
+.. warning::
+
+    This command drops an existing tap-specific slot, with or without ``--force``.
+    Slot replacement is not atomic: a failure during drop or recreation leaves
+    bookmarks invalidated, and the slot may be absent or replaced.
+    Stop scheduled replication and complete
+    the whole-tap resync; do not restore old LOG_BASED bookmarks after a completed
+    or uncertain drop.
+
+
+FastSync Errors
+'''''''''''''''
+
+.. _troubleshooting_snowflake_varchar_width:
+
+Snowflake VARCHAR width is incompatible
+"""""""""""""""""""""""""""""""""""""""
+
+Snowflake FastSync stages MariaDB/MySQL and PostgreSQL string-like and fallback
+types as ``VARCHAR(134217728)``. Managed Iceberg v3 also requires every existing
+string column to have ``CHARACTER_MAXIMUM_LENGTH`` 134217728.
+
+For a managed Iceberg v3 target, widen the reported column with ``ALTER ICEBERG
+TABLE ... ALTER COLUMN ... SET DATA TYPE VARCHAR(134217728)`` or recreate the
+table, then retry. PipelineWise does not change existing Iceberg widths.
+
+For a native PartialSync target, PipelineWise widens a compatible narrow text
+column before the merge. If that DDL fails, use a role authorized to alter the
+table or widen it manually, then retry. The failed attempt does not run the merge
+or advance state. A non-text target type requires a FullSync or an explicit,
+reviewed schema migration.
+
+``VARCHAR(134217728)`` remains subject to Snowflake's 128 MB encoded-value limit.
+If the maximum-width column still rejects a value, measure its encoded byte size
+and reduce, split, or exclude it at the source.
+
+.. _troubleshooting_iceberg_publication:
+
+Iceberg publication remains ambiguous
+""""""""""""""""""""""""""""""""""""""""
+
+A Snowflake connection can fail after a publication statement commits but before
+the client receives its response. PipelineWise keeps the source state unchanged
+and records the attempt in an ``iceberg-recovery-<hash>.json`` stream manifest
+and ``iceberg-fastsync-target-<hash>.json`` target pointer under the generated
+target runtime directory at ``$PIPELINEWISE_CONFIG_DIRECTORY/<target_id>/``.
+
+Stop other writers to the target table and retry the same command without editing
+state, dropping staging objects, or deleting either recovery file. Use the same
+generated target runtime directory, tap/source identity, target mapping and role,
+staging configuration, and transformations. For CTAS or ``INSERT OVERWRITE``,
+PipelineWise polls query history every five seconds for up to 900 seconds by
+default. Each lookup scans at most 10,000 visible queries from five minutes
+before the persisted submission time and can observe the publication while it
+is active. Snowflake connector timeouts are best-effort, so a call can make the
+observed wall-clock duration exceed the nominal budget. PipelineWise requires
+the exact query tag, verifies the target, and resumes finalization. For
+PartialSync, it replays the persisted range transaction deterministically.
+Query-history visibility can lag, so a later retry may be required while
+Snowflake retains the Information Schema query history.
+
+Set the positive integer ``iceberg_query_history_poll_timeout_seconds`` in the
+Snowflake target's ``db_conn`` when 900 seconds is insufficient. The setting is
+not part of recovery identity, so it can be increased before retrying the same
+command unchanged.
+
+Query-history visibility timeouts and lookup failures are reported as retryable
+publication ambiguity. Their failure message confirms that the recovery files
+and staging table were preserved and instructs the operator to retry the same
+FastSync command unchanged; PipelineWise does not automatically republish or
+advance state.
+
+If reconciliation remains ambiguous, preserve the stream manifest, target
+pointer, staging table, S3 keys, query tag, target identity, and logs. Inspect
+them with a role that can see all relevant table metadata and query history
+before changing target objects. See :ref:`snowflake_iceberg_recovery`.
+
+.. _troubleshooting_iceberg_conversion_missing_primary:
+
+Native-to-Iceberg primary name is absent
+""""""""""""""""""""""""""""""""""""""""
+
+``copy_native_to_iceberg --eventual iceberg`` uses one statement to rename the
+native table to ``<table>_NATIVE`` and another to promote
+``<table>_ICEBERG``. Rollback likewise uses two statements. The primary name is
+absent between them, and an interruption can extend that reader outage until
+recovery runs.
+
+Keep every reader and writer stopped. Retry the identical command from the same
+imported target runtime directory with the same table, ``--eventual`` value,
+target identity, and account role. The retry restores ``<table>_NATIVE`` to the
+primary name before it validates anything, then repeats the cutover. Do not
+rename or drop companion tables and do not delete or edit the recovery manifest.
+If PipelineWise cannot prove one safe table state, inspect the primary,
+``_NATIVE``, ``_ICEBERG``, and manifest before making a manual change. See
+:ref:`snowflake_iceberg`.
+
+.. _troubleshooting_iceberg_conversion_unreadable_manifest:
+
+Native-to-Iceberg manifest cannot be read
+"""""""""""""""""""""""""""""""""""""""""
+
+``copy_native_to_iceberg``, Snowflake Iceberg FastSync, or a PostgreSQL slot reset
+fails with ``Iceberg publication requires a row count and row fingerprint`` for a
+table that was converted earlier. Singer runs for the table can also fail with
+``Table <schema>."<TABLE>" is native, but target_table_format requires
+managed_iceberg_v3``.
+
+Before 0.98.1, rerunning ``copy_native_to_iceberg --eventual iceberg`` after a
+completed conversion could rename the live Iceberg table to ``<table>_ICEBERG``.
+It then restored the old ``<table>_NATIVE`` table as ``<table>`` and saved a
+manifest that no command can read. PipelineWise 0.98.1 and later never save such
+a manifest, and a rerun after a completed conversion changes nothing.
+
+To recover:
+
+1. Upgrade to 0.98.1 or later. Keep every reader and writer of the table stopped.
+2. In ``$PIPELINEWISE_CONFIG_DIRECTORY/<target_id>/``, find the
+   ``iceberg-recovery-<hash>.json`` file whose ``kind`` is ``manual_conversion``
+   and whose ``target`` names this table. If there is no such file, this entry
+   does not apply. A completed ``--eventual native`` conversion leaves the same
+   tables without a manifest.
+3. Confirm that ``<table>`` is native and ``<table>_ICEBERG`` is Iceberg, for
+   example from the ``is_iceberg`` column of ``SHOW TABLES``. Confirm that no
+   writer changed ``<table>`` after the failed rerun; otherwise reconcile those
+   rows first.
+4. Rename the tables back to their converted state:
+
+   .. code-block:: sql
+
+      ALTER TABLE <database>.<schema>.<table>
+        RENAME TO <database>.<schema>.<table>_NATIVE;
+
+      ALTER ICEBERG TABLE <database>.<schema>.<table>_ICEBERG
+        RENAME TO <database>.<schema>.<table>;
+
+5. Remove only the manifest file found in step 2. Keep every other recovery file.
+6. Rerun ``copy_native_to_iceberg --eventual iceberg`` for the table. It confirms
+   the completed conversion and changes nothing.
+
+.. _troubleshooting_iceberg_conversion_contents_changed:
+
+Native-to-Iceberg contents changed after cutover
+""""""""""""""""""""""""""""""""""""""""""""""""
+
+``copy_native_to_iceberg --eventual iceberg`` fails after promotion with
+``does not match the projected contents``, ``Promoted Iceberg contents do not
+match staged conversion evidence``, ``schema or primary key does not match the
+conversion source``, or ``Native backup schema no longer matches the conversion
+manifest``. Every retry fails the same way. While the manifest exists, Iceberg
+FastSync refuses the table, and an Iceberg PostgreSQL tap cannot reset its
+replication slot.
+
+A writer changed the rows or columns of the promoted table, or its native backup,
+after the cutover.
+PipelineWise keeps the promoted table live, because renaming it away could hide
+those writes. Keep every reader and writer of the table stopped, compare
+``<table>`` with ``<table>_NATIVE``, and decide which copy is correct:
+
+- **The promoted Iceberg table is correct**, for example because replication
+  restarted early and loaded new rows. Validate it as described in
+  :ref:`snowflake_iceberg`. Then remove only the ``iceberg-recovery-<hash>.json``
+  file in ``$PIPELINEWISE_CONFIG_DIRECTORY/<target_id>/`` whose ``kind`` is
+  ``manual_conversion`` and whose ``target`` names this table. The conversion is
+  complete, and ``<table>_NATIVE`` stays as the rollback point.
+- **The native backup is correct.** Rename ``<table>`` to ``<table>_ICEBERG`` with
+  ``ALTER ICEBERG TABLE``, then ``<table>_NATIVE`` to ``<table>`` with
+  ``ALTER TABLE``. Reconcile any rows written to the Iceberg table. Rename
+  ``<table>_ICEBERG`` aside or drop it, because a retry refuses a stale
+  companion. Remove the manifest as described above and run the conversion
+  again.
+
+.. _troubleshooting_iceberg_auto_conversion:
+
+Automatic native-to-Iceberg conversion stopped
+""""""""""""""""""""""""""""""""""""""""""""""
+
+*Log message:*
+
+.. code-block:: text
+
+    Automatic native-to-Iceberg conversion stopped. <database>.<schema>.<TABLE> (stream <stream>) ...
+
+or ``Automatic native-to-Iceberg conversion of <table> (stream <stream>) failed``.
+The tap's alert reads ``<tap_id> tap failed: native-to-Iceberg conversion stopped``.
+
+*Why it happens:*
+A tap with ``native_to_iceberg_conversion`` enabled could not leave every
+selected table new or Iceberg, so ``run_tap`` stopped before replication. The
+message names each table and the reason:
+
+* ``needs an operator``: for example a leftover ``<table>_NATIVE``, a companion
+  table without a manifest, an unreadable manifest, a pending
+  ``--eventual native`` conversion, two streams that write the same table but
+  map one column to ``TEXT`` and ``VARIANT``, a table that
+  ``is also written by tap <tap_id>`` without managed Iceberg v3 and conversion
+  enabled or from another target, or a companion name that another tap writes;
+* ``cannot be converted``: a preflight blocker, such as a policy, a stream, a
+  ``TIMESTAMP_TZ`` column, sub-microsecond values, a grant that Iceberg cannot
+  carry, or a ``TEXT``/``VARIANT`` mismatch with the tap catalog;
+* ``failed``: the conversion itself raised an error, or a resumed attempt
+  restored its table name and then stopped for one of the reasons above;
+* ``stopped before any Snowflake work``: the main configuration enables
+  conversion, but the tap's generated configuration is not imported with its
+  Iceberg settings, for example after ``import_config --taps`` without this
+  tap. Run ``import_config`` for the tap;
+* ``The tap catalog is older than its imported settings``: the last
+  ``import_config`` failed before it rediscovered the tap. Fix the import error
+  and run ``import_config`` again.
+
+*How to fix:*
+
+1. Pause the tap's schedule until you have fixed the cause. Each scheduled run
+   preflights every native table again and restarts a copy that failed. The tap
+   never replicates into native tables, and tables that converted earlier stay
+   converted. Keep ``native_to_iceberg_conversion`` enabled while you recover:
+   with ``enabled: false``, ``run_tap`` does not resume a pending conversion. Do
+   not deselect a stream or change its schema mapping to unblock the tap while
+   its table has a pending conversion. Finish that conversion first with
+   ``copy_native_to_iceberg --eventual iceberg``, once the table's other blockers
+   are resolved: that command does not check other taps that write the table.
+   Add ``--conversion-warehouse`` to keep it off the loading warehouse.
+2. List the remaining blockers with the feasibility report, and rerun it after
+   each fix until it is ready:
+
+   .. code-block:: bash
+
+       pipelinewise copy_native_to_iceberg --target <target_id> --tap <tap_id> \
+         --preflight-only --iceberg-version 3
+
+3. Fix each blocker. For a failed conversion, fix the cause named in the error.
+   The report lists only the blockers it can detect: a statement timeout, a
+   missing ``APPLY`` or ``MANAGE GRANTS`` privilege, or changed contents shows
+   only in the run's error, so the report can be ready while the cause remains.
+   The manifest records the attempt, and the next ``run_tap`` resumes it. For an interrupted cutover, see
+   :ref:`troubleshooting_iceberg_conversion_missing_primary`. For a table that
+   another tap under the same target writes, pause both and import that tap with
+   ``target_table_format: iceberg``, ``iceberg_version: 3``,
+   ``data_flattening_max_level: 0`` and ``native_to_iceberg_conversion`` enabled
+   too, or stop it writing the table. A tap under another target must stop
+   writing the table, or move under this target. For a companion name that
+   another tap writes, change one stream's schema mapping.
+
+   If a failed conversion says ``<table>_ICEBERG does not match the projected
+   contents of <table>`` before any cutover, ``<table>`` changed after the copy.
+   Stop every writer to it and drop ``<table>_ICEBERG``. Keep the manifest: the
+   next ``run_tap`` copies the table again.
+
+   A pending attempt that a conversion check now refuses, for example one
+   started by an earlier release, keeps its manifest and companion table. A grant
+   or sub-microsecond values can be fixed in place, and the next ``run_tap``
+   resumes the attempt. A fix that changes the table's columns, such as replacing
+   a ``TIMESTAMP_TZ`` column or changing a ``TEXT`` column to ``VARIANT``, makes
+   every resume fail with ``The schema of <table> changed after conversion started``.
+   While ``<table>`` is still native, discard that attempt instead: remove its
+   manifest and drop ``<table>_ICEBERG`` as described in
+   :ref:`troubleshooting_iceberg_conversion_contents_changed`, then rerun.
+4. Resume the schedule, or rerun ``run_tap``. Watch PostgreSQL WAL and MySQL
+   binlog retention while the tap is stopped.
+
+See :ref:`snowflake_iceberg_auto_conversion`.
+
+.. _troubleshooting_fastsync_table_not_found:
+
+Table not found
+"""""""""""""""
+
+*Log message:*
+
+.. code-block:: text
+
+    CRITICAL: {SCHEMA_NAME}.TABLE_NAME table not found.
+
+*Why it happens:*
+FastSync cannot find the table in the source database. Common causes:
+
+1. Wrong ``source_schema`` name in the tap definition.
+2. The table does not exist in the source database.
+3. The replication user does not have ``SELECT`` privilege on the table.
+
+*How to fix:*
+
+1. Check if the given source schema exists and is correct.
+2. Verify that the table exists in the source. If it does not exist, remove
+   it from the tap YAML file.
+3. Verify user privileges by running:
+
+   .. code-block:: sql
+
+       SELECT * FROM information_schema.columns
+       WHERE table_schema = '{SCHEMA_NAME}' AND table_name = '{TABLE_NAME}';
+
+   If this returns no results, the replication user lacks ``SELECT`` privilege.
+
+.. _troubleshooting_discovery_zero_tables:
+
+Failure to import tap (0 tables discovered)
+"""""""""""""""""""""""""""""""""""""""""""
+
+*Log message:*
+
+.. code-block:: text
+
+    CRITICAL 0 tables were discovered across the entire cluster
+
+*Why it happens:*
+
+1. The source database does not exist.
+2. The replication user does not have enough privileges to ``SELECT``.
+
+*How to fix:*
+
+1. Verify that the source database exists and the tap configuration points to
+   the correct host and database name.
+2. Test that the replication user can run a ``SELECT`` query on one of the tables
+   in the source database.
+
+
+.. _troubleshooting_logging:
+
+Logging and Diagnostics
+'''''''''''''''''''''''
+
+Use ``pipelinewise status`` to get an overview of all configured pipelines and
+their last run status. Use ``pipelinewise test_tap_connection`` to verify
+connectivity to a source before running a full sync.
+
+Runtime files are written below ``PIPELINEWISE_CONFIG_DIRECTORY``, which defaults
+to ``~/.pipelinewise``. Tap logs are stored under
+``<target_id>/<tap_id>/log/`` and use ``.running``, ``.success``, or ``.failed``
+suffixes. See :ref:`logging` for details.
+
+MariaDB/MySQL, PostgreSQL, and MongoDB connections log their source hostname at
+INFO once per host per process in FastSync and Singer. Repeated connections to
+the same host use DEBUG. The hostname reflects the selected primary or replica
+connection. MongoDB logs the configured seed hostname or host list.
+
+Configured passwords, tokens, passphrases, AWS secrets, and MySQL ``ssl_key``
+contents are redacted from connector logs and default exception tracebacks,
+including worker threads.
+Configured multiline secrets are also redacted when connector output arrives
+one line at a time. Short fragments are masked only in credential fields or as
+complete lines. Replication state and control messages retain their original contents.
+Usernames and short passwords are redacted in credential fields and connection
+URI userinfo. Short secrets are also redacted after ``Bearer`` and in recognised
+authentication error formats, such as ``authentication failed (<secret>)`` and
+``invalid credentials: <secret>``. Database names and counts remain visible when
+they match those values. Unlabelled short values in other text remain visible.
+
+Snowflake data errors replace the server message with a redacted summary in
+Singer, FastSync, and data-diff logs and alerts. This covers duplicate-row errors,
+SQLSTATE ``22xxx`` data errors, and messages containing ``Row Values:``. The error
+type, error code, SQLSTATE, and query ID remain visible when provided by Snowflake.
+Other errors, including missing objects and permissions, keep their diagnostic
+text. Use the query ID to investigate in Snowflake with an authorised role.
+Redaction does not change whether a run fails or how replication state is saved.
+
+Snowflake native and managed Iceberg PartialSync log column versioning at INFO
+after the rename succeeds. The message follows Singer's format:
+
+.. code-block:: text
+
+    Column "AMOUNT" in table ""DATABASE"."SCHEMA"."TABLE"" has been renamed to "AMOUNT_20261007_120000_123456"
+
+To follow the progress of a running sync:
+
+.. code-block:: bash
+
+    $ pipelinewise_config_dir="${PIPELINEWISE_CONFIG_DIRECTORY:-$HOME/.pipelinewise}"
+    $ tail -f "$pipelinewise_config_dir/<target_id>/<tap_id>/log/"*running
+
+You can also check the temporary files being written during a sync:
+
+.. code-block:: bash
+
+    $ ls -lah "$pipelinewise_config_dir/tmp/"*<tap_id>*
+
+
+Verify recovery
+---------------
+
+After applying a repair:
+
+1. restart the same tap-target pair without advancing state again;
+2. confirm the command and ``pipelinewise status`` report success;
+3. verify exact primary keys or a deterministic checksum in the affected range;
+4. confirm the source bookmark or replication-slot acknowledgement advances;
+5. retain the failed log and state backup until another normal run succeeds; and
+6. remove temporary or staging objects only after their publication state is
+   understood.

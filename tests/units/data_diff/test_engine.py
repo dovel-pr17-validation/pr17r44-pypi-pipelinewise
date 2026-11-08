@@ -1,0 +1,1622 @@
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal
+from unittest.mock import MagicMock, Mock, call, patch
+
+import psycopg2
+import pytest
+
+from pipelinewise.data_diff.comparison import (
+    UnsupportedComparisonError,
+    checksum_columns,
+    metric_passes,
+    schema_compatibility_result,
+)
+from pipelinewise.data_diff.engine import (
+    DatabaseAdapter,
+    DataDiffExecutionError,
+    HistoricalWindowNotReady,
+    MetricQueryResult,
+    MySQLAdapter,
+    PostgresAdapter,
+    SnowflakeAdapter,
+    YugabyteAdapter,
+    _ordered_results,
+    build_metric_query,
+    canonical_value,
+    connect_source,
+    connect_target,
+    preflight_source,
+    run_check,
+)
+
+
+def _usable_index(columns, name="idx", **overrides):
+    """Index metadata as a healthy btree index reports it."""
+    return {"index_name": name, "columns": columns, "is_usable": True, **overrides}
+
+
+class FakeAdapter(DatabaseAdapter):
+    def __init__(self, *, indexes, table_rows=100_000):
+        super().__init__(Mock(), statement_timeout_seconds=30)
+        self._indexes = indexes
+        self._table_rows = table_rows
+        self.row_count_queries = []
+
+    def indexes(self, _schema, _table):
+        return self._indexes
+
+    def count_rows_up_to(self, schema, table, limit):
+        self.row_count_queries.append((schema, table, limit))
+        return min(self._table_rows, limit)
+
+
+class RunAdapter(FakeAdapter):
+    def __init__(self, columns, values=None, minimum=None):
+        super().__init__(indexes=[
+            _usable_index([name]) for name, column in columns.items()
+            if column.get("data_type", "").lower().startswith("timestamp")
+        ])
+        self.columns = columns
+        self.values = values or {}
+        self.connection = Mock()
+        self.executed = []
+        self.minimum = minimum
+        self.minimum_queries = []
+
+    def resolve_columns(self, _schema, _table, requested, *, allow_missing=False):
+        resolved = {}
+        for name in requested:
+            if name in self.columns:
+                resolved[name] = self.columns[name]
+            elif allow_missing:
+                resolved[name] = {"name": name, "data_type": None, "missing": True}
+            else:
+                raise AssertionError(name)
+        return resolved
+
+    def execute_metrics(self, sql, params, checks):
+        self.executed.append((sql, params, checks))
+        return MetricQueryResult(
+            values={check: self.values[check] for check in checks},
+            duration_seconds=0.25,
+        )
+
+    def minimum_timestamp(self, schema, table, column, cutoff):
+        self.minimum_queries.append((schema, table, column, cutoff))
+        return self.minimum
+
+    def close(self):
+        self.connection.close()
+
+
+def test_final_results_require_every_declared_check():
+    with pytest.raises(KeyError, match='row_count'):
+        _ordered_results({}, ('row_count',))
+
+    assert _ordered_results({}, ('row_count',), allow_missing=True) == []
+
+
+def test_metric_query_is_half_open_parameterized_and_quotes_identifiers():
+    adapter = FakeAdapter(indexes=[])
+    sql = build_metric_query(
+        adapter,
+        'public',
+        'order"items',
+        'select',
+        'updated_at',
+        (
+            "row_count", "distinct_key_count", "null_key_count",
+            "duplicate_key_count", "min_key", "max_key",
+        ),
+    )
+
+    assert 'FROM "public"."order""items"' in sql
+    assert '"updated_at" >= %s' in sql
+    assert '"updated_at" < %s' in sql
+    assert "COUNT(DISTINCT \"select\")" in sql
+    assert 'COUNT(*) - COUNT("select") AS "null_key_count"' in sql
+    assert (
+        'COUNT("select") - COUNT(DISTINCT "select") AS "duplicate_key_count"'
+        in sql
+    )
+
+
+@pytest.mark.parametrize("adapter_type", [PostgresAdapter, MySQLAdapter, SnowflakeAdapter])
+def test_metric_query_excludes_null_timestamps_for_every_adapter(adapter_type):
+    adapter = adapter_type(None, 30)
+    sql = build_metric_query(
+        adapter, "public", "payments", "id", "updated_at", ("row_count",),
+    )
+
+    timestamp = adapter.quote("updated_at")
+    assert f"{timestamp} < %s" in sql
+    assert "IS NULL" not in sql
+    assert f"{timestamp} >= %s" in sql
+    assert sql.count("%s") == 2
+
+
+@pytest.mark.parametrize("adapter_type", [PostgresAdapter, MySQLAdapter, SnowflakeAdapter])
+@pytest.mark.parametrize("as_dict", [False, True])
+def test_minimum_timestamp_is_parameterized_and_normalizes_driver_values(adapter_type, as_dict):
+    connection = MagicMock()
+    cursor = connection.cursor.return_value.__enter__.return_value
+    value = datetime(2026, 7, 1, 8, tzinfo=timezone(timedelta(hours=2)))
+    cursor.fetchone.return_value = {"MIN(timestamp)": value} if as_dict else (value,)
+    adapter = adapter_type(connection, 30)
+    cutoff = datetime(2026, 7, 22, 13, tzinfo=timezone.utc)
+    column = _column('updated"at', "timestamp without time zone")
+
+    minimum = adapter.minimum_timestamp("public", "payments", column, cutoff)
+
+    assert minimum == datetime(2026, 7, 1, 6, tzinfo=timezone.utc)
+    sql, params = cursor.execute.call_args.args
+    quoted = adapter.quote(column["name"])
+    assert f"SELECT MIN({quoted})" in sql
+    assert f"WHERE {quoted} < %s" in sql
+    assert params == (cutoff.replace(tzinfo=None),)
+
+
+@pytest.mark.parametrize("value", [None, datetime(2026, 7, 1, 6)])
+def test_minimum_timestamp_handles_empty_and_naive_results(value):
+    connection = MagicMock()
+    connection.cursor.return_value.__enter__.return_value.fetchone.return_value = (value,)
+    adapter = PostgresAdapter(connection, 30)
+    cutoff = datetime(2026, 7, 22, 13, tzinfo=timezone.utc)
+
+    result = adapter.minimum_timestamp("public", "payments", _column("ts", "timestamp"), cutoff)
+
+    assert result == (None if value is None else value.replace(tzinfo=timezone.utc))
+
+
+def _column(name, data_type, **metadata):
+    return {
+        "name": name,
+        "data_type": data_type,
+        "missing": False,
+        **metadata,
+    }
+
+
+def test_schema_compatibility_uses_replication_type_families_and_reports_missing():
+    compatible = schema_compatibility_result([
+        ("id", _column("id", "bigint"), _column("ID", "NUMBER")),
+        (
+            "created_at",
+            _column("created_at", "date"),
+            _column("CREATED_AT", "TIMESTAMP_NTZ"),
+        ),
+        ("status", _column("status", "text"), _column("STATUS", "VARCHAR")),
+    ])
+    missing = schema_compatibility_result([
+        (
+            "status",
+            _column("status", "text"),
+            {"name": "STATUS", "data_type": None, "missing": True},
+        )
+    ])
+
+    assert compatible["status"] == "PASS"
+    assert missing["status"] == "FAIL"
+    assert missing["error"] is not None
+    assert "target missing" in str(missing["error"])
+    assert missing["target_value"]["columns"][0]["resolved_name"] is None
+
+
+def test_checksum_uses_common_typed_normalization_for_each_dialect():
+    pairs = [
+        (
+            "id",
+            _column("id", "bigint", numeric_scale=0),
+            _column("ID", "NUMBER", numeric_scale=0),
+        ),
+        (
+            "updated_at",
+            _column("updated_at", "timestamp without time zone"),
+            _column("UPDATED_AT", "TIMESTAMP_NTZ"),
+        ),
+        ("status", _column("status", "text"), _column("STATUS", "VARCHAR")),
+    ]
+    source_columns, target_columns = checksum_columns(pairs)
+
+    postgres_sql = build_metric_query(
+        FakeAdapter(indexes=[]),
+        "public", "payments", "id", "updated_at", ("row_checksum",),
+        checksum_columns_for_query=source_columns,
+    )
+    mysql_sql = build_metric_query(
+        MySQLAdapter(None, 30),
+        "public", "payments", "id", "updated_at", ("row_checksum",),
+        checksum_columns_for_query=source_columns,
+    )
+    snowflake_sql = build_metric_query(
+        SnowflakeAdapter(None, 30),
+        "PUBLIC", "PAYMENTS", "ID", "UPDATED_AT", ("row_checksum",),
+        checksum_columns_for_query=target_columns,
+    )
+    postgres_target_sql = build_metric_query(
+        PostgresAdapter(None, 30),
+        "replicated", "payments", "id", "updated_at", ("row_checksum",),
+        checksum_columns_for_query=target_columns,
+    )
+
+    assert "SUBSTRING(MD5(" in postgres_sql
+    assert "TO_CHAR(\"updated_at\", 'YYYY-MM-DD HH24:MI:SS.US')" in postgres_sql
+    assert "CONV(SUBSTRING(MD5(" in mysql_sql
+    # Doubled in the SQL, single once PyMySQL interpolates the bound parameters.
+    assert "DATE_FORMAT(`updated_at`, '%%Y-%%m-%%d %%H:%%i:%%s.%%f')" in mysql_sql
+    assert "DATE_FORMAT(`updated_at`, '%Y-%m-%d %H:%i:%s.%f')" in mysql_sql % (
+        "2026-07-01", "2026-07-02",
+    )
+    assert "MD5_NUMBER_LOWER64" in snowflake_sql
+    assert "CONVERT_TIMEZONE('UTC', \"UPDATED_AT\")" in snowflake_sql
+    assert "CASE WHEN" in postgres_sql
+    assert "SUBSTRING(MD5(" in postgres_target_sql
+    assert '"replicated"."payments"' in postgres_target_sql
+
+
+def test_checksum_rejects_approximate_and_missing_columns():
+    with pytest.raises(UnsupportedComparisonError, match="unsupported type family"):
+        checksum_columns([
+            (
+                "amount",
+                _column("amount", "double precision"),
+                _column("AMOUNT", "FLOAT"),
+            )
+        ])
+
+    with pytest.raises(UnsupportedComparisonError, match="incompatible"):
+        checksum_columns([
+            (
+                "status",
+                _column("status", "text"),
+                {"name": "STATUS", "data_type": None, "missing": True},
+            )
+        ])
+
+    missing = {"name": "status", "data_type": None, "missing": True}
+    with pytest.raises(UnsupportedComparisonError) as exc:
+        checksum_columns([("status", missing, missing)])
+    assert str(exc.value) == (
+        "row_checksum column 'status' has incompatible source and target types "
+        "(missing, missing)"
+    )
+
+
+def test_key_integrity_checks_require_zero_on_both_sides():
+    assert metric_passes("row_count", "2", "2")
+    assert metric_passes("null_key_count", "0", "0")
+    assert metric_passes("duplicate_key_count", 0, Decimal("0"))
+    assert not metric_passes("null_key_count", "1", "1")
+    assert not metric_passes("duplicate_key_count", "0", "2")
+
+
+@pytest.mark.parametrize("historical", [False, True])
+def test_schema_only_run_uses_metadata_without_executing_aggregate_query(historical):
+    source = RunAdapter({
+        "id": _column("id", "bigint", numeric_scale=0),
+        "updated_at": _column("updated_at", "timestamp without time zone"),
+        "status": _column("status", "text"),
+    })
+    target = RunAdapter({
+        "ID": _column("ID", "NUMBER", numeric_scale=0),
+        "UPDATED_AT": _column("UPDATED_AT", "TIMESTAMP_NTZ"),
+        "STATUS": _column("STATUS", "VARCHAR"),
+    })
+    source.indexes = Mock(side_effect=AssertionError("Metadata-only checks must not inspect indexes"))
+    check = {
+        "source_schema": "public",
+        "source_table": "payments",
+        "target_schema": "PUBLIC",
+        "target_table": "PAYMENTS",
+        "source_key_column": "id",
+        "target_key_column": "ID",
+        "source_timestamp_column": "updated_at",
+        "target_timestamp_column": "UPDATED_AT",
+        "source_compare_columns": ["status"],
+        "target_compare_columns": ["STATUS"],
+        "checks": ["schema_compatibility"],
+    }
+    start = None if historical else datetime(2026, 7, 22, 12, tzinfo=timezone.utc)
+    end = datetime(2026, 7, 22, 13, tzinfo=timezone.utc)
+
+    with patch(
+        "pipelinewise.data_diff.engine.connect_source",
+        return_value=source,
+    ), patch(
+        "pipelinewise.data_diff.engine.connect_target",
+        return_value=target,
+    ):
+        preflight, results, status = run_check(check, {}, {}, start, end)
+
+    assert status == "PASS"
+    assert results[0]["check_type"] == "schema_compatibility"
+    assert "Metadata-only" in preflight["findings"][0]
+    assert source.executed == []
+    assert target.executed == []
+    assert source.minimum_queries == target.minimum_queries == []
+    assert source.row_count_queries == target.row_count_queries == []
+    source.indexes.assert_not_called()
+
+
+@pytest.mark.parametrize("historical", [False, True])
+@pytest.mark.parametrize("later_side", ["source", "target"])
+@pytest.mark.parametrize('unindexed_rows', [None, 49_999, 75_000])
+def test_run_check_binds_the_same_window_on_source_and_target(historical, later_side, unindexed_rows):
+    source = RunAdapter({
+        "id": _column("id", "bigint"),
+        "updated_at": _column("updated_at", "timestamp without time zone"),
+    }, values={"row_count": "2"})
+    target = RunAdapter({
+        "ID": _column("ID", "NUMBER"),
+        "UPDATED_AT": _column("UPDATED_AT", "TIMESTAMP_NTZ"),
+    }, values={"row_count": "2"})
+    if unindexed_rows is not None:
+        source._indexes = []
+        source._table_rows = unindexed_rows
+    check = {
+        "source_schema": "public", "source_table": "payments",
+        "target_schema": "PUBLIC", "target_table": "PAYMENTS",
+        "source_key_column": "id", "target_key_column": "ID",
+        "source_timestamp_column": "updated_at",
+        "target_timestamp_column": "UPDATED_AT",
+        "checks": ["row_count"],
+    }
+    regular_start = datetime(2026, 7, 22, 12, tzinfo=timezone.utc)
+    earlier_start = regular_start - timedelta(days=10)
+    overlap_start = regular_start - timedelta(days=7)
+    source.minimum = overlap_start if later_side == "source" else earlier_start
+    target.minimum = overlap_start if later_side == "target" else earlier_start
+    window_start = None if historical else regular_start
+    window_end = datetime(2026, 7, 22, 13, tzinfo=timezone.utc)
+    published = []
+    resolved = []
+
+    def record_preflight(preflight):
+        assert source.minimum_queries == target.minimum_queries == []
+        assert source.executed == target.executed == []
+        published.append(preflight)
+
+    def record_start(start):
+        assert len(published) == 1
+        assert source.executed == target.executed == []
+        resolved.append(start)
+
+    with patch(
+        "pipelinewise.data_diff.engine.connect_source", return_value=source,
+    ), patch(
+        "pipelinewise.data_diff.engine.connect_target", return_value=target,
+    ):
+        preflight, results, status = run_check(
+            check, {}, {}, window_start, window_end,
+            on_preflight=record_preflight, on_window_start=record_start,
+        )
+
+    assert preflight["status"] == status == "PASS"
+    assert preflight['index_warning'] is (unindexed_rows == 75_000)
+    assert source.row_count_queries == ([] if unindexed_rows is None else [('public', 'payments', 100_000)])
+    assert target.row_count_queries == []
+    assert published == [preflight]
+    assert results[0]["status"] == "PASS"
+    expected_start = overlap_start if historical else regular_start
+    expected_params = (expected_start.replace(tzinfo=None), window_end.replace(tzinfo=None))
+    assert resolved == ([overlap_start] if historical else [])
+    assert len(source.minimum_queries) == len(target.minimum_queries) == int(historical)
+    for sql, params, checks in (source.executed[0], target.executed[0]):
+        assert params == expected_params
+        assert checks == ("row_count",)
+        assert " < %s" in sql
+        assert " >= %s" in sql
+        assert "IS NULL" not in sql
+
+
+@pytest.mark.parametrize("empty_side", ["source", "target", "both"])
+@pytest.mark.parametrize("checks", [["row_count"], ["schema_compatibility", "row_count"]])
+def test_historical_scan_does_not_pass_without_timestamped_data_on_both_sides(empty_side, checks):
+    start = datetime(2026, 7, 1, tzinfo=timezone.utc)
+    end = datetime(2026, 7, 22, 13, tzinfo=timezone.utc)
+    columns = {"id": _column("id", "bigint"), "ts": _column("ts", "timestamp")}
+    source = RunAdapter(columns, minimum=None if empty_side in ("source", "both") else start)
+    target = RunAdapter(columns, minimum=None if empty_side in ("target", "both") else start)
+    check = {
+        "source_schema": "public", "source_table": "payments",
+        "target_schema": "public", "target_table": "payments",
+        "source_key_column": "id", "target_key_column": "id",
+        "source_timestamp_column": "ts", "target_timestamp_column": "ts",
+        "checks": checks,
+    }
+    expected_error = HistoricalWindowNotReady if empty_side == "both" else DataDiffExecutionError
+    with patch("pipelinewise.data_diff.engine.connect_source", return_value=source), patch(
+        "pipelinewise.data_diff.engine.connect_target", return_value=target,
+    ), pytest.raises(expected_error, match="non-NULL timestamp before the cutoff") as raised:
+        run_check(check, {}, {}, None, end)
+
+    assert type(raised.value) is expected_error
+    assert end.isoformat() in str(raised.value)
+    assert ("both source and target" if empty_side == "both" else f"{empty_side} has no") in str(raised.value)
+    assert source.executed == target.executed == []
+
+
+@pytest.mark.parametrize(
+    "checks,source_type,target_type,expected_results",
+    [
+        (["schema_compatibility", "row_count"], "text", "bigint", [("schema_compatibility", "FAIL")]),
+        (["row_checksum", "row_count"], "double precision", "double precision", [("row_checksum", "ERROR")]),
+    ],
+)
+def test_empty_history_keeps_known_metadata_failures(checks, source_type, target_type, expected_results):
+    columns = {"id": _column("id", "bigint"), "ts": _column("ts", "timestamp")}
+    source = RunAdapter({**columns, "value": _column("value", source_type)})
+    target = RunAdapter({**columns, "value": _column("value", target_type)})
+    check = {
+        "source_schema": "public", "source_table": "payments",
+        "target_schema": "public", "target_table": "payments",
+        "source_key_column": "id", "target_key_column": "id",
+        "source_timestamp_column": "ts", "target_timestamp_column": "ts",
+        "source_compare_columns": ["value"], "target_compare_columns": ["value"],
+        "checks": checks,
+    }
+    resolved = []
+    with patch("pipelinewise.data_diff.engine.connect_source", return_value=source), patch(
+        "pipelinewise.data_diff.engine.connect_target", return_value=target,
+    ):
+        preflight, results, status = run_check(
+            check, {}, {}, None, datetime(2026, 7, 22, 13, tzinfo=timezone.utc),
+            on_window_start=resolved.append,
+        )
+
+    assert preflight["status"] == "PASS"
+    assert status == "ERROR"
+    assert [(result["check_type"], result["status"]) for result in results] == expected_results
+    assert results[0]["error"]
+    assert resolved == []
+    assert len(source.minimum_queries) == len(target.minimum_queries) == 1
+    assert source.executed == target.executed == []
+
+
+@pytest.mark.parametrize("historical", [False, True])
+@pytest.mark.parametrize('preflight_status,error_phase', [('BLOCKED', None), ('ERROR', 'catalog'), ('ERROR', 'count')])
+@pytest.mark.parametrize(
+    "checks,source_type,target_type,expected_results",
+    [
+        (["row_count"], "text", "text", []),
+        (
+            ["row_count", "schema_compatibility", "distinct_key_count"],
+            "text", "text", [("schema_compatibility", "PASS")],
+        ),
+        (
+            ["row_count", "schema_compatibility", "distinct_key_count"],
+            "text", "bigint", [("schema_compatibility", "FAIL")],
+        ),
+        (
+            ["row_count", "row_checksum", "schema_compatibility", "distinct_key_count"],
+            "double precision", "double precision",
+            [("row_checksum", "ERROR"), ("schema_compatibility", "PASS")],
+        ),
+        (
+            ["row_checksum"], "double precision", "double precision",
+            [("row_checksum", "ERROR")],
+        ),
+        (
+            ["schema_compatibility", "row_checksum"], "double precision", "text",
+            [("schema_compatibility", "FAIL"), ("row_checksum", "ERROR")],
+        ),
+    ],
+)
+def test_failed_preflight_keeps_metadata_results_without_reading_data(
+    historical, preflight_status, error_phase, checks, source_type, target_type, expected_results,
+):
+    columns = {"id": _column("id", "bigint"), "ts": _column("ts", "timestamp")}
+    source = RunAdapter({**columns, "value": _column("value", source_type)})
+    target = RunAdapter({**columns, "value": _column("value", target_type)})
+    source.indexes = Mock(return_value=[])
+    if error_phase == 'catalog':
+        source.indexes.side_effect = RuntimeError("catalog unavailable")
+    elif error_phase == 'count':
+        source.count_rows_up_to = Mock(side_effect=TimeoutError('bounded row count timed out'))
+    check = {
+        "source_schema": "public", "source_table": "payments",
+        "target_schema": "public", "target_table": "payments",
+        "source_key_column": "id", "target_key_column": "id",
+        "source_timestamp_column": "ts", "target_timestamp_column": "ts",
+        "source_compare_columns": ["value"], "target_compare_columns": ["value"],
+        "checks": checks,
+    }
+    published = []
+
+    def record_preflight(preflight):
+        assert source.minimum_queries == target.minimum_queries == []
+        assert source.executed == target.executed == []
+        published.append(preflight)
+
+    with patch("pipelinewise.data_diff.engine.connect_source", return_value=source), patch(
+        "pipelinewise.data_diff.engine.connect_target", return_value=target,
+    ):
+        preflight, results, status = run_check(
+            check, {}, {}, None if historical else datetime(2026, 7, 22, 12, tzinfo=timezone.utc),
+            datetime(2026, 7, 22, 13, tzinfo=timezone.utc),
+            on_preflight=record_preflight,
+        )
+    assert preflight["status"] == preflight_status, preflight
+    assert [(result["check_type"], result["status"]) for result in results] == expected_results
+    assert status is None
+    assert published == [preflight]
+    source.indexes.assert_called_once_with("public", "payments")
+    assert source.minimum_queries == target.minimum_queries == []
+    assert source.executed == target.executed == []
+
+
+@pytest.mark.parametrize("discover", [False, True])
+def test_year_one_is_a_real_historical_boundary_and_is_not_rediscovered(discover):
+    start = datetime.min.replace(tzinfo=timezone.utc)
+    end = datetime(2026, 7, 22, 13, tzinfo=timezone.utc)
+    columns = {"id": _column("id", "bigint"), "ts": _column("ts", "timestamp without time zone")}
+    source = RunAdapter(columns, {"row_count": "2"}, minimum=start)
+    target = RunAdapter(columns, {"row_count": "2"}, minimum=start)
+    check = {
+        "source_schema": "public", "source_table": "payments",
+        "target_schema": "public", "target_table": "payments",
+        "source_key_column": "id", "target_key_column": "id",
+        "source_timestamp_column": "ts", "target_timestamp_column": "ts",
+        "checks": ["row_count"],
+    }
+    resolved = []
+    with patch("pipelinewise.data_diff.engine.connect_source", return_value=source), patch(
+        "pipelinewise.data_diff.engine.connect_target", return_value=target,
+    ):
+        _preflight, _results, status = run_check(
+            check, {}, {}, None if discover else start, end, on_window_start=resolved.append,
+        )
+
+    assert status == "PASS"
+    assert resolved == ([start] if discover else [])
+    assert len(source.minimum_queries) == len(target.minimum_queries) == int(discover)
+    assert source.executed[0][1] == target.executed[0][1] == (
+        start.replace(tzinfo=None), end.replace(tzinfo=None),
+    )
+
+
+@pytest.mark.parametrize("historical", [False, True])
+@pytest.mark.parametrize("checks", [["row_checksum"], ["row_checksum", "schema_compatibility"]])
+def test_unsupported_metrics_require_index_without_reading_data(historical, checks):
+    columns = {
+        "id": _column("id", "bigint"), "ts": _column("ts", "timestamp"),
+        "value": _column("value", "double precision"),
+    }
+    source, target = RunAdapter(columns), RunAdapter(columns)
+    source.indexes = Mock(wraps=source.indexes)
+    check = {
+        "source_schema": "public", "source_table": "payments",
+        "target_schema": "public", "target_table": "payments",
+        "source_key_column": "id", "target_key_column": "id",
+        "source_timestamp_column": "ts", "target_timestamp_column": "ts",
+        "source_compare_columns": ["value"], "target_compare_columns": ["value"],
+        "checks": checks,
+    }
+    published = []
+    with patch("pipelinewise.data_diff.engine.connect_source", return_value=source), patch(
+        "pipelinewise.data_diff.engine.connect_target", return_value=target,
+    ), patch("pipelinewise.data_diff.engine._utc_boundary") as convert_boundary:
+        preflight, results, status = run_check(
+            check, {}, {}, None if historical else datetime(2026, 7, 22, 12, tzinfo=timezone.utc),
+            datetime(2026, 7, 22, 13, tzinfo=timezone.utc),
+            on_preflight=published.append,
+        )
+
+    assert preflight["status"] == "PASS"
+    assert preflight["has_leading_index"] is True
+    assert status == "ERROR"
+    assert [result["check_type"] for result in results] == checks
+    assert results[0]["status"] == "ERROR"
+    assert "unsupported type family" in results[0]["error"]
+    if "schema_compatibility" in checks:
+        assert results[1]["status"] == "PASS"
+    assert published == [preflight]
+    source.indexes.assert_called_once_with("public", "payments")
+    assert source.minimum_queries == target.minimum_queries == []
+    assert source.executed == target.executed == []
+    convert_boundary.assert_not_called()
+
+
+@pytest.mark.parametrize("failing_side", ["source", "target"])
+def test_historical_minimum_failure_keeps_the_start_unresolved_and_closes_connections(failing_side):
+    columns = {"id": _column("id", "bigint"), "ts": _column("ts", "timestamp")}
+    start = datetime(2026, 7, 1, tzinfo=timezone.utc)
+    source = RunAdapter(columns, minimum=start)
+    target = RunAdapter(columns, minimum=start)
+    failing = source if failing_side == "source" else target
+    failing.minimum_timestamp = Mock(side_effect=DataDiffExecutionError("MIN query timed out"))
+    check = {
+        "source_schema": "public", "source_table": "payments",
+        "target_schema": "public", "target_table": "payments",
+        "source_key_column": "id", "target_key_column": "id",
+        "source_timestamp_column": "ts", "target_timestamp_column": "ts",
+        "checks": ["row_count"],
+    }
+    published, resolved = [], []
+    with patch("pipelinewise.data_diff.engine.connect_source", return_value=source), patch(
+        "pipelinewise.data_diff.engine.connect_target", return_value=target,
+    ), pytest.raises(DataDiffExecutionError, match="MIN query timed out"):
+        run_check(
+            check, {}, {}, None, datetime(2026, 7, 22, 13, tzinfo=timezone.utc),
+            on_preflight=published.append, on_window_start=resolved.append,
+        )
+
+    assert len(published) == 1
+    assert published[0]["status"] == "PASS"
+    assert resolved == []
+    assert source.executed == target.executed == []
+    source.connection.rollback.assert_called_once()
+    source.connection.close.assert_called_once()
+    target.connection.close.assert_called_once()
+
+
+def test_run_check_closes_source_when_target_connect_fails():
+    source = RunAdapter({})
+    check = {"source_schema": "public", "source_table": "payments"}
+    start = datetime(2026, 7, 22, 12, tzinfo=timezone.utc)
+    end = datetime(2026, 7, 22, 13, tzinfo=timezone.utc)
+
+    with patch(
+        "pipelinewise.data_diff.engine.connect_source",
+        return_value=source,
+    ), patch(
+        "pipelinewise.data_diff.engine.connect_target",
+        side_effect=DataDiffExecutionError("target unavailable"),
+    ):
+        with pytest.raises(DataDiffExecutionError):
+            run_check(check, {}, {}, start, end)
+
+    source.connection.close.assert_called_once()
+
+
+@pytest.mark.parametrize("indexes", [
+    [],
+    [_usable_index(["id"])],
+    [_usable_index(["id", "updated_at"])],
+    [_usable_index([])],
+])
+def test_preflight_blocks_without_a_leading_timestamp_index(indexes):
+    preflight = preflight_source(
+        FakeAdapter(indexes=indexes),
+        "public", "payments", "updated_at", "SELECT 1", (),
+    )
+
+    assert preflight["status"] == "BLOCKED"
+    assert "No usable source index starts with timestamp column" in preflight["findings"][0]
+    assert preflight["has_leading_index"] is False
+
+
+def test_preflight_accepts_a_leading_timestamp_index_without_reading_row_estimates():
+    indexes = [_usable_index(["UPDATED_AT", "id"])]
+    adapter = FakeAdapter(indexes=indexes)
+    preflight = preflight_source(
+        adapter,
+        "public", "payments", "updated_at", "SELECT 1", (),
+    )
+
+    adapter.connection.cursor.assert_not_called()
+    assert preflight["status"] == "PASS", preflight
+    assert preflight["index_metadata"] == indexes
+    assert preflight["has_leading_index"] is True
+    assert preflight['table_rows'] is None
+    assert preflight['row_limit'] is None
+    assert preflight['index_warning'] is False
+    assert adapter.row_count_queries == []
+
+
+@pytest.mark.parametrize('table_rows,expected_status,expected_warning', [
+    (0, 'PASS', False),
+    (1, 'PASS', False),
+    (49_999, 'PASS', False),
+    (50_000, 'PASS', True),
+    (99_999, 'PASS', True),
+    (100_000, 'BLOCKED', False),
+    (100_001, 'BLOCKED', False),
+    (1_000_000, 'BLOCKED', False),
+])
+@pytest.mark.parametrize('initial_scan', [False, True])
+def test_unindexed_preflight_counts_the_whole_source_at_exact_boundaries(
+    table_rows, expected_status, expected_warning, initial_scan,
+):
+    adapter = FakeAdapter(indexes=[], table_rows=table_rows)
+    params = (None, '2026-10-09') if initial_scan else ('2026-10-08', '2026-10-09')
+
+    preflight = preflight_source(adapter, 'public', 'payments', 'updated_at', 'SELECT 1', params)
+
+    assert preflight['status'] == expected_status
+    assert preflight['index_warning'] is expected_warning
+    assert preflight['table_rows'] == min(table_rows, 100_000)
+    assert preflight['row_limit'] == 100_000
+    assert preflight['has_leading_index'] is False
+    assert adapter.row_count_queries == [('public', 'payments', 100_000)]
+    assert preflight['findings']
+
+
+@pytest.mark.parametrize('indexes', [
+    [_usable_index(['id', 'updated_at'])],
+    [_usable_index(['updated_at'], is_usable=False, is_partial=True)],
+    [_usable_index(['updated_at'], is_usable=False, is_hidden=True)],
+])
+def test_small_table_exemption_does_not_make_an_unusable_index_qualify(indexes):
+    preflight = preflight_source(
+        FakeAdapter(indexes=indexes, table_rows=99_999),
+        'public', 'payments', 'updated_at', 'SELECT 1', (),
+    )
+
+    assert preflight['status'] == 'PASS'
+    assert preflight['has_leading_index'] is False
+    assert preflight['index_warning'] is True
+    assert preflight['index_metadata'] == indexes
+
+
+@pytest.mark.parametrize('adapter_type', [PostgresAdapter, MySQLAdapter])
+@pytest.mark.parametrize('table_rows', [0, 75_000, 100_000])
+@pytest.mark.parametrize('as_dict', [False, True])
+def test_bounded_source_count_quotes_the_table_and_never_filters_rows(adapter_type, table_rows, as_dict):
+    connection = MagicMock()
+    cursor = connection.cursor.return_value.__enter__.return_value
+    cursor.fetchone.return_value = {'table_rows': table_rows} if as_dict else (table_rows,)
+    adapter = adapter_type(connection, 30)
+
+    count = adapter.count_rows_up_to('odd"schema', 'partition`parent', 100_000)
+
+    assert count == table_rows
+    sql, params = cursor.execute.call_args.args
+    assert f'SELECT 1 FROM {adapter.qualified_table("odd\"schema", "partition`parent")}' in sql
+    assert 'SELECT COUNT(*) AS table_rows FROM (' in sql
+    assert 'LIMIT %s) AS ppw_preflight_rows' in sql
+    assert 'WHERE' not in sql
+    assert 'ONLY' not in sql
+    assert params == (100_000,)
+    assert adapter.statement_timeout_seconds == 30
+
+
+@pytest.mark.parametrize('row', [None, (), {}, {'table_rows': None}, (True,), (-1,), (100_001,), ('10',), (1.5,)])
+def test_malformed_bounded_source_count_fails_closed(row):
+    connection = MagicMock()
+    cursor = connection.cursor.return_value.__enter__.return_value
+    cursor.fetchone.return_value = row
+    adapter = PostgresAdapter(connection, 30)
+    adapter.indexes = Mock(return_value=[])
+
+    preflight = preflight_source(adapter, 'public', 'payments', 'updated_at', 'SELECT 1', ())
+
+    assert preflight['status'] == 'ERROR'
+    assert preflight['table_rows'] is None
+    assert preflight['index_warning'] is False
+    assert 'valid integer' in preflight['error']
+
+
+def test_bounded_source_count_timeout_keeps_index_evidence_and_fails_closed():
+    connection = MagicMock()
+    cursor = connection.cursor.return_value.__enter__.return_value
+    cursor.execute.side_effect = TimeoutError('bounded source count timed out')
+    adapter = PostgresAdapter(connection, 30)
+    indexes = [_usable_index(['updated_at'], name='partial_idx', is_usable=False)]
+    adapter.indexes = Mock(return_value=indexes)
+
+    preflight = preflight_source(adapter, 'public', 'payments', 'updated_at', 'SELECT 1', ())
+
+    assert preflight['status'] == 'ERROR'
+    assert preflight['error'] == 'bounded source count timed out'
+    assert preflight['index_metadata'] == indexes
+    assert preflight['has_leading_index'] is False
+    assert preflight['table_rows'] is None
+    assert preflight['index_warning'] is False
+
+
+def test_preflight_records_an_error_without_blocking_the_run_silently():
+    class FailingAdapter(FakeAdapter):
+        def indexes(self, _schema, _table):
+            raise RuntimeError("catalog unavailable")
+
+    preflight = preflight_source(
+        FailingAdapter(indexes=[]),
+        "public", "payments", "updated_at", "SELECT 1", (),
+    )
+
+    assert preflight["status"] == "ERROR"
+    assert preflight["error"] == "catalog unavailable"
+
+
+def test_canonical_value_normalizes_numbers_and_timestamps_to_utc():
+    instant = datetime(2026, 7, 22, 14, 0, tzinfo=timezone(timedelta(hours=2)))
+
+    assert canonical_value(Decimal("1.000")) == "1"
+    assert canonical_value(1) == canonical_value(Decimal("1"))
+    assert canonical_value(1.50) == "1.5"
+    assert canonical_value(instant) == "2026-07-22T12:00:00Z"
+    assert canonical_value(datetime(2026, 7, 22, 12, 0)) == "2026-07-22T12:00:00Z"
+
+
+def _connection_with_cursor(server_version="8.0.39"):
+    cursor = Mock()
+    cursor_context = MagicMock()
+    cursor_context.__enter__.return_value = cursor
+    connection = Mock(closed=False)
+    connection.cursor.return_value = cursor_context
+    connection.get_server_info.return_value = server_version
+    return connection, cursor
+
+
+def test_postgres_source_is_read_only_utc_and_time_limited():
+    connection, cursor = _connection_with_cursor()
+    check = {"source_type": "tap-postgres", "statement_timeout_seconds": 300}
+    config = {
+        "host": "primary",
+        "replica_host": "replica",
+        "port": 5432,
+        "user": "reader",
+        "password": "secret",
+        "dbname": "payments",
+    }
+
+    with patch(
+        "pipelinewise.data_diff.engine.psycopg2.connect",
+        return_value=connection,
+    ) as connect:
+        connect_source(check, config)
+
+    assert connect.call_args.kwargs["host"] == "replica"
+    connection.set_session.assert_called_once_with(readonly=True, autocommit=False)
+    assert cursor.execute.call_args_list == [
+        call("SELECT set_config('TimeZone', 'UTC', true)"),
+        call("SELECT set_config('statement_timeout', %s, true)", ("300s",)),
+    ]
+
+
+@pytest.mark.parametrize(
+    "server_version",
+    ["11.4.10-MariaDB-log", "5.5.5-10.6.18-MariaDB-ubu2004-log"],
+)
+def test_mariadb_source_is_detected_and_time_limited_without_engine(server_version):
+    connection, cursor = _connection_with_cursor(server_version)
+    check = {"source_type": "tap-mysql", "statement_timeout_seconds": 120}
+    config = {
+        "host": "source",
+        "port": 3306,
+        "user": "reader",
+        "password": "secret",
+        "dbname": "payments",
+    }
+
+    with patch(
+        "pipelinewise.data_diff.engine.pymysql.connect",
+        return_value=connection,
+    ):
+        connect_source(check, config)
+
+    assert cursor.execute.call_args_list == [
+        call("SET SESSION time_zone = '+00:00'"),
+        call("SET SESSION max_statement_time = %s", (120,)),
+        call("START TRANSACTION READ ONLY"),
+    ]
+
+
+def test_mysql_source_is_detected_and_time_limited_without_engine():
+    connection, cursor = _connection_with_cursor("8.0.39")
+    check = {"source_type": "tap-mysql", "statement_timeout_seconds": 120}
+    config = {
+        "host": "source",
+        "port": 3306,
+        "user": "reader",
+        "password": "secret",
+        "dbname": "payments",
+    }
+
+    with patch(
+        "pipelinewise.data_diff.engine.pymysql.connect",
+        return_value=connection,
+    ):
+        connect_source(check, config)
+
+    assert cursor.execute.call_args_list == [
+        call("SET SESSION time_zone = '+00:00'"),
+        call("SET SESSION max_execution_time = %s", (120_000,)),
+        call("START TRANSACTION READ ONLY"),
+    ]
+
+
+@pytest.mark.parametrize(
+    "engine,server_version,timeout_call",
+    [
+        (
+            "mariadb",
+            "8.0.39",
+            call("SET SESSION max_statement_time = %s", (120,)),
+        ),
+        (
+            "mysql",
+            "11.4.10-MariaDB-log",
+            call("SET SESSION max_execution_time = %s", (120_000,)),
+        ),
+    ],
+)
+def test_explicit_engine_overrides_server_version(
+    engine, server_version, timeout_call
+):
+    connection, cursor = _connection_with_cursor(server_version)
+    check = {"source_type": "tap-mysql", "statement_timeout_seconds": 120}
+    config = {
+        "host": "source",
+        "port": 3306,
+        "user": "reader",
+        "password": "secret",
+        "dbname": "payments",
+        "engine": engine,
+    }
+
+    with patch(
+        "pipelinewise.data_diff.engine.pymysql.connect",
+        return_value=connection,
+    ):
+        connect_source(check, config)
+
+    assert cursor.execute.call_args_list == [
+        call("SET SESSION time_zone = '+00:00'"),
+        timeout_call,
+        call("START TRANSACTION READ ONLY"),
+    ]
+
+
+def test_mysql_source_attempts_tls_without_explicit_ssl_config():
+    """tap-mysql and FastSync always offer TLS. Data-diff must match them, or a
+    server that requires encryption rejects it as 'Access denied'."""
+    connection, _ = _connection_with_cursor()
+    check = {"source_type": "tap-mysql", "statement_timeout_seconds": 60}
+    config = {
+        "host": "source",
+        "port": 3306,
+        "user": "reader",
+        "password": "secret",
+        "dbname": "payments",
+        "engine": "mariadb",
+    }
+
+    with patch(
+        "pipelinewise.data_diff.engine.pymysql.connect",
+        return_value=connection,
+    ) as connect:
+        connect_source(check, config)
+
+    assert connect.call_args.kwargs["ssl"] == {"": True}
+
+
+def test_mysql_source_prefers_an_explicit_ssl_context():
+    connection, _ = _connection_with_cursor()
+    check = {"source_type": "tap-mysql", "statement_timeout_seconds": 60}
+    config = {
+        "host": "source",
+        "port": 3306,
+        "user": "reader",
+        "password": "secret",
+        "dbname": "payments",
+        "engine": "mariadb",
+        "ssl": "true",
+    }
+
+    with patch(
+        "pipelinewise.data_diff.engine.pymysql.connect",
+        return_value=connection,
+    ) as connect:
+        connect_source(check, config)
+
+    assert connect.call_args.kwargs["ssl"] != {"": True}
+
+
+def test_snowflake_target_session_is_utc_and_time_limited():
+    connection = Mock()
+    check = {
+        "check_id": "check-id",
+        "target_type": "target-snowflake",
+        "statement_timeout_seconds": 90,
+    }
+    config = {
+        "user": "reader",
+        "password": "secret",
+        "account": "account",
+        "dbname": "analytics",
+        "warehouse": "QUALITY",
+    }
+
+    with patch("snowflake.connector.connect", return_value=connection) as connect:
+        connect_target(check, config)
+
+    parameters = connect.call_args.kwargs["session_parameters"]
+    assert parameters["TIMEZONE"] == "UTC"
+    assert parameters["STATEMENT_TIMEOUT_IN_SECONDS"] == 90
+
+
+def test_postgres_target_is_direct_read_only_utc_and_time_limited():
+    connection, cursor = _connection_with_cursor()
+    check = {
+        "target_type": "target-postgres",
+        "statement_timeout_seconds": 75,
+    }
+    config = {
+        "host": "target",
+        "replica_host": "must-not-be-used",
+        "port": 5432,
+        "user": "target_reader",
+        "password": "secret",
+        "dbname": "analytics",
+        "ssl": "true",
+    }
+
+    with patch(
+        "pipelinewise.data_diff.engine.psycopg2.connect",
+        return_value=connection,
+    ) as connect:
+        adapter = connect_target(check, config)
+
+    assert isinstance(adapter, PostgresAdapter)
+    assert connect.call_args.kwargs["host"] == "target"
+    assert connect.call_args.kwargs["user"] == "target_reader"
+    assert connect.call_args.kwargs["sslmode"] == "require"
+    assert (
+        connect.call_args.kwargs["application_name"]
+        == "pipelinewise-data-diff-target"
+    )
+    connection.set_session.assert_called_once_with(readonly=True, autocommit=False)
+    assert cursor.execute.call_args_list == [
+        call("SELECT set_config('TimeZone', 'UTC', true)"),
+        call("SELECT set_config('statement_timeout', %s, true)", ("75s",)),
+    ]
+
+
+def test_unsupported_target_type_is_rejected():
+    with pytest.raises(DataDiffExecutionError, match="Unsupported target type"):
+        connect_target(
+            {
+                "target_type": "target-unknown",
+                "statement_timeout_seconds": 30,
+            },
+            {},
+        )
+
+
+def test_mysql_checksum_sql_survives_client_side_interpolation():
+    """PyMySQL interpolates SQL client-side, so DATE_FORMAT specifiers must be
+    doubled. A bare %Y raises before the query ever reaches MySQL."""
+    adapter = MySQLAdapter(Mock(), statement_timeout_seconds=60)
+    sql = build_metric_query(
+        adapter,
+        "payments",
+        "transfers",
+        "transfer_id",
+        "updated_at",
+        ("row_count", "row_checksum"),
+        checksum_columns_for_query=[
+            {"name": "updated_at", "checksum_kind": "timestamp"},
+            {"name": "status", "checksum_kind": "string"},
+        ],
+    )
+
+    # The two window boundaries every metric query binds.
+    interpolated = sql % ("2026-07-01 00:00:00", "2026-07-02 00:00:00")
+
+    # MySQL must receive single specifiers, whatever the SQL carried.
+    assert "DATE_FORMAT" in interpolated
+    assert "%Y-%m-%d %H:%i:%s.%f" in interpolated
+    assert "%%" not in interpolated
+
+
+def test_mysql_time_checksum_sql_survives_client_side_interpolation():
+    adapter = MySQLAdapter(Mock(), statement_timeout_seconds=60)
+
+    normalized = adapter.normalize_checksum_value(
+        {"name": "started_at", "checksum_kind": "time"}
+    )
+
+    assert normalized % () == "DATE_FORMAT(`started_at`, '%H:%i:%s.%f')"
+
+
+def _cursor_returning(row):
+    cursor = MagicMock()
+    cursor.__enter__ = Mock(return_value=cursor)
+    cursor.__exit__ = Mock(return_value=False)
+    cursor.fetchone.return_value = row
+    connection = Mock()
+    connection.cursor.return_value = cursor
+    return connection, cursor
+
+
+def test_snowflake_execute_metrics_rejects_missing_row():
+    connection, _cursor = _cursor_returning(None)
+    adapter = SnowflakeAdapter(connection, statement_timeout_seconds=60)
+
+    with pytest.raises(DataDiffExecutionError, match="Aggregate query returned no row"):
+        adapter.execute_metrics(
+            "SELECT COUNT(*) AS row_count", (), ("row_count",)
+        )
+
+
+def test_boolean_null_is_distinguishable_from_false_in_every_dialect():
+    # A NULL that collapses to the FALSE branch hashes identically to FALSE, so a
+    # source NULL against a target FALSE would be an invisible mismatch.
+    column = {"name": "is_active", "checksum_kind": "boolean"}
+
+    for adapter in (
+        PostgresAdapter(None, 30), MySQLAdapter(None, 30), SnowflakeAdapter(None, 30)
+    ):
+        expression = adapter.normalize_checksum_value(column)
+        assert "IS NULL" in expression, adapter.__class__.__name__
+
+
+def test_mysql_checksum_integer_casts_before_subtracting():
+    # CONV returns a string; subtracting from it coerces to DOUBLE and SUM() then
+    # loses integer precision over a large window.
+    expression = MySQLAdapter(None, 30).checksum_integer("payload")
+
+    assert "CAST(CONV(" in expression
+    assert "AS DECIMAL(38, 0))" in expression
+
+
+def test_checksum_numeric_scale_keeps_the_wider_precision():
+    # Rounding to the target's narrower scale would make a lossy replica hash
+    # identically to its source.
+    pairs = [(
+        "amount",
+        _column("amount", "numeric", numeric_scale=4),
+        _column("AMOUNT", "NUMBER", numeric_scale=2),
+    )]
+
+    source_columns, target_columns = checksum_columns(pairs)
+
+    assert source_columns[0]["checksum_scale"] == 4
+    assert target_columns[0]["checksum_scale"] == 4
+
+
+def test_preflight_ignores_an_unusable_timestamp_index():
+    # A partial, invalid, not-ready or non-btree index cannot serve a window scan,
+    # so it must not count as proof the table is readable by timestamp.
+    unusable = _usable_index(
+        ["updated_at"], name="partial_idx", is_usable=False, is_partial=True
+    )
+    preflight = preflight_source(
+        FakeAdapter(indexes=[unusable]),
+        "public", "payments", "updated_at", "SELECT 1", (),
+    )
+
+    assert preflight["status"] == "BLOCKED"
+    # The unusable index is still reported, so the evidence explains the block.
+    assert "partial_idx" in " ".join(preflight["findings"])
+    assert preflight["index_metadata"] == [unusable]
+
+
+def test_preflight_persists_its_decision_inputs():
+    indexes = [_usable_index(["updated_at"])]
+    preflight = preflight_source(
+        FakeAdapter(indexes=indexes),
+        "public", "payments", "updated_at", "SELECT 1", (),
+    )
+
+    assert preflight["status"] == "PASS"
+    assert preflight["index_metadata"] == indexes
+    assert preflight["has_leading_index"] is True
+    assert preflight["query_fingerprint"]
+
+
+def test_preflight_verdict_does_not_depend_on_the_window():
+    # Index eligibility is independent of window width, including initial scans.
+    # Keep this pinned so a wide window cannot become another blocking condition.
+    adapter = FakeAdapter(indexes=[_usable_index(["updated_at"])])
+    narrow = preflight_source(
+        adapter, "public", "payments", "updated_at", "SELECT 1",
+        ("2026-07-01", "2026-07-01 00:01:00"),
+    )
+    wide = preflight_source(
+        adapter, "public", "payments", "updated_at", "SELECT 1",
+        ("2020-01-01", "2030-01-01"),
+    )
+
+    assert narrow["status"] == wide["status"] == "PASS"
+    assert narrow["query_fingerprint"] == wide["query_fingerprint"]
+
+
+@pytest.mark.parametrize("configured,expected", [(0, 1), (0.5, 1), (30, 30)])
+def test_statement_timeout_never_reaches_zero(configured, expected):
+    # Both engines read 0 as "no limit", so a sub-second budget must round up to a
+    # real one rather than silently disabling the timeout.
+    connection, cursor = _connection_with_cursor()
+    check = {"source_type": "tap-mysql", "statement_timeout_seconds": configured}
+    config = {
+        "host": "source", "port": 3306, "user": "reader",
+        "password": "secret", "dbname": "payments", "engine": "mariadb",
+    }
+
+    with patch(
+        "pipelinewise.data_diff.engine.pymysql.connect", return_value=connection
+    ):
+        connect_source(check, config)
+
+    assert call("SET SESSION max_statement_time = %s", (expected,)) in (
+        cursor.execute.call_args_list
+    )
+
+
+def test_every_preflight_branch_is_published_before_execution():
+    """Including the metadata-only branch, which has no aggregates to order against.
+
+    A run that publishes nothing leaves dd_run_attempts.preflight_id NULL on success, and
+    the runner's placeholder logic then reports a computed preflight as never built.
+    """
+    published = []
+
+    source = RunAdapter({
+        "id": _column("id", "bigint", numeric_scale=0),
+        "updated_at": _column("updated_at", "timestamp without time zone"),
+    })
+    target = RunAdapter({
+        "id": _column("id", "bigint", numeric_scale=0),
+        "updated_at": _column("updated_at", "timestamp without time zone"),
+    })
+    check = {
+        "checks": ["schema_compatibility"],
+        "source_type": "tap-postgres",
+        "target_type": "target-postgres",
+        "source_schema": "public",
+        "source_table": "payments",
+        "target_schema": "replicated",
+        "target_table": "payments",
+        "source_key_column": "id",
+        "target_key_column": "id",
+        "source_timestamp_column": "updated_at",
+        "target_timestamp_column": "updated_at",
+        "source_compare_columns": [],
+        "target_compare_columns": [],
+        "statement_timeout_seconds": 30,
+    }
+
+    with patch(
+        "pipelinewise.data_diff.engine.connect_source", return_value=source
+    ), patch(
+        "pipelinewise.data_diff.engine.connect_target", return_value=target
+    ):
+        preflight, _results, status = run_check(
+            check, {}, {},
+            datetime(2026, 7, 31, 11, tzinfo=timezone.utc),
+            datetime(2026, 7, 31, 12, tzinfo=timezone.utc),
+            on_preflight=published.append,
+        )
+
+    assert status == "PASS"
+    # No aggregate ran, but the preflight is still handed out exactly once.
+    assert published == [preflight]
+    assert source.executed == []
+
+
+def _mysql_index_cursor(visibility_columns, index_rows):
+    """Fake a STATISTICS cursor: first the catalog probe, then the index rows."""
+    cursor = MagicMock()
+    cursor.__enter__ = Mock(return_value=cursor)
+    cursor.__exit__ = Mock(return_value=False)
+    cursor.fetchall.side_effect = [
+        [{"column_name": name} for name in visibility_columns],
+        index_rows,
+    ]
+    connection = Mock()
+    connection.cursor.return_value = cursor
+    return connection, cursor
+
+
+@pytest.mark.parametrize(
+    "visibility_column,hidden_value,visible_value",
+    [
+        # MySQL 8 and MariaDB 10.6 spell this with opposite senses.
+        ("IS_VISIBLE", "NO", "YES"),
+        ("IGNORED", "YES", "NO"),
+    ],
+)
+def test_mysql_hidden_index_is_not_usable(
+    visibility_column, hidden_value, visible_value
+):
+    """An INVISIBLE/IGNORED index yields no possible keys, so it cannot certify a scan."""
+    rows = [
+        {
+            "index_name": "ix_hidden", "column_name": "updated_at", "sequence": 1,
+            "non_unique": 1, "index_type": "BTREE", "sub_part": None,
+            "visibility": hidden_value,
+        },
+        {
+            "index_name": "ix_live", "column_name": "created_at", "sequence": 1,
+            "non_unique": 1, "index_type": "BTREE", "sub_part": None,
+            "visibility": visible_value,
+        },
+    ]
+    connection, cursor = _mysql_index_cursor([visibility_column], rows)
+    adapter = MySQLAdapter(connection, statement_timeout_seconds=60)
+
+    indexes = {index["index_name"]: index for index in adapter.indexes("db", "payments")}
+
+    assert indexes["ix_hidden"]["is_usable"] is False
+    assert indexes["ix_live"]["is_usable"] is True
+    assert visibility_column in cursor.execute.call_args_list[-1].args[0]
+
+
+def test_mysql_without_a_visibility_column_keeps_btree_indexes_usable():
+    """MySQL 5.7 has neither column, so the probe must not disqualify every index."""
+    # The query selects NULL AS visibility when neither column exists.
+    rows = [{
+        "index_name": "ix_ts", "column_name": "updated_at", "sequence": 1,
+        "non_unique": 1, "index_type": "BTREE", "sub_part": None,
+        "visibility": None,
+    }]
+    connection, cursor = _mysql_index_cursor([], rows)
+    adapter = MySQLAdapter(connection, statement_timeout_seconds=60)
+
+    assert adapter.indexes("db", "payments")[0]["is_usable"] is True
+    assert "IS_VISIBLE" not in cursor.execute.call_args_list[-1].args[0]
+    assert "IGNORED" not in cursor.execute.call_args_list[-1].args[0]
+
+
+def test_mysql_visibility_column_is_probed_once_per_connection():
+    cursor = MagicMock()
+    cursor.__enter__ = Mock(return_value=cursor)
+    cursor.__exit__ = Mock(return_value=False)
+    cursor.fetchall.side_effect = [[{"column_name": "IGNORED"}], [], []]
+    connection = Mock()
+    connection.cursor.return_value = cursor
+    adapter = MySQLAdapter(connection, statement_timeout_seconds=60)
+
+    adapter.indexes("db", "first")
+    adapter.indexes("db", "second")
+
+    # One probe plus one query per table: the catalog is not re-read per table.
+    assert cursor.execute.call_count == 3
+
+
+def test_hidden_leading_index_blocks_a_source_table():
+    """A hidden timestamp index must not satisfy preflight."""
+    adapter = FakeAdapter(indexes=[{
+        "index_name": "ix_ts", "columns": ["updated_at"], "is_unique": False,
+        "access_method": "btree", "is_usable": False,
+    }])
+
+    preflight = preflight_source(
+        adapter, "db", "payments", "updated_at", "SELECT 1", ()
+    )
+
+    adapter.connection.cursor.assert_not_called()
+    assert preflight["status"] == "BLOCKED", preflight
+    assert preflight["has_leading_index"] is False
+    # Naming it separates "no index" from "an index you disabled".
+    assert any("ix_ts" in finding for finding in preflight["findings"])
+
+
+def test_yugabyte_source_is_direct_read_only_utc_and_time_limited():
+    connection, cursor = _connection_with_cursor()
+    check = {"source_type": "tap-yugabyte", "statement_timeout_seconds": 300}
+    config = {
+        "host": "yb-node",
+        "port": 5433,
+        "user": "reader",
+        "password": "secret",
+        "dbname": "payments",
+        "ssl": "true",
+        "load_balance": "true",
+        "topology_keys": "aws.eu-west-1.eu-west-1a",
+    }
+
+    with patch(
+        "pipelinewise.data_diff.engine.psycopg2.connect",
+        return_value=connection,
+    ) as connect:
+        adapter = connect_source(check, config)
+
+    assert isinstance(adapter, YugabyteAdapter)
+    assert connect.call_args.kwargs["host"] == "yb-node"
+    assert connect.call_args.kwargs["port"] == 5433
+    assert connect.call_args.kwargs["sslmode"] == "require"
+    # The main venv's psycopg2-binary rejects the YugabyteDB driver's connection keys.
+    assert "load_balance" not in connect.call_args.kwargs
+    assert "topology_keys" not in connect.call_args.kwargs
+    connection.set_session.assert_called_once_with(readonly=True, autocommit=False)
+    assert cursor.execute.call_args_list == [
+        call("SELECT set_config('TimeZone', 'UTC', true)"),
+        call("SELECT set_config('statement_timeout', %s, true)", ("300s",)),
+    ]
+
+
+BUCKET = "(yb_hash_code(id) % 3)"
+
+
+def _yb_index_row(name, key_columns, key_attnums, key_options, **overrides):
+    """One YugabyteAdapter catalog row; attnum 0 marks an expression key."""
+    return {
+        "index_name": name,
+        "access_method": "lsm",
+        "is_unique": False,
+        "is_partial": False,
+        "is_expression": 0 in key_attnums,
+        "is_valid": True,
+        "is_ready": True,
+        "key_attnums": key_attnums,
+        "key_options": key_options,
+        "key_columns": key_columns,
+        "primary_key": ["id"],
+        **overrides,
+    }
+
+
+def _yugabyte_adapter(rows):
+    cursor = MagicMock()
+    cursor.__enter__ = Mock(return_value=cursor)
+    cursor.__exit__ = Mock(return_value=False)
+    cursor.fetchall.return_value = rows
+    connection = Mock()
+    connection.cursor.return_value = cursor
+    return YugabyteAdapter(connection, statement_timeout_seconds=60), cursor
+
+
+@pytest.mark.parametrize(
+    "row,usable",
+    [
+        # pg_index.indoption per key column: ASC 0, DESC 3, YugabyteDB HASH 4.
+        (_yb_index_row("asc", ["updated_at"], [2], [0]), True),
+        (_yb_index_row("desc", ["updated_at"], [2], [3]), True),
+        (_yb_index_row("hash", ["updated_at"], [2], [4]), False),
+        (_yb_index_row("partial", ["updated_at"], [2], [0], is_partial=True), False),
+        (_yb_index_row("building", ["updated_at"], [2], [0], is_ready=False), False),
+        (_yb_index_row("invalid", ["updated_at"], [2], [0], is_valid=False), False),
+        (_yb_index_row("gin", ["updated_at"], [2], [0], access_method="ybgin"), False),
+        (_yb_index_row("expression", ["lower(note)"], [0], [0]), False),
+    ],
+    ids=lambda value: value.get("index_name") if isinstance(value, dict) else None,
+)
+def test_yugabyte_plain_index_usability(row, usable):
+    adapter, _cursor = _yugabyte_adapter([row])
+
+    index = adapter.indexes("public", "payments")[0]
+
+    assert index["is_usable"] is usable
+    assert index["bucket"] is None
+    assert index["columns"] == row["key_columns"]
+
+
+@pytest.mark.parametrize(
+    "row,usable,bucket",
+    [
+        (
+            _yb_index_row("keyset", [BUCKET, "updated_at", "id"], [0, 2, 1], [0, 0, 0]),
+            True, {"columns": ["id"], "modulus": 3},
+        ),
+        (
+            _yb_index_row(
+                "composite", ["(yb_hash_code(a, b) % 5)", "updated_at", "a", "b"],
+                [0, 3, 1, 2], [0, 0, 0, 0], primary_key=["a", "b"],
+            ),
+            True, {"columns": ["a", "b"], "modulus": 5},
+        ),
+        (
+            _yb_index_row(
+                "quoted", ['(yb_hash_code("Id") % 4)', "Up At", "Id"],
+                [0, 2, 1], [0, 0, 0], primary_key=["Id"],
+            ),
+            True, {"columns": ["Id"], "modulus": 4},
+        ),
+        # A non-key column can be NULL, and NULL % N matches no IN-list value.
+        (
+            _yb_index_row(
+                "hashes_timestamp", ["(yb_hash_code(updated_at) % 3)", "updated_at", "id"],
+                [0, 2, 1], [0, 0, 0],
+            ),
+            False, {"columns": ["updated_at"], "modulus": 3},
+        ),
+        (
+            _yb_index_row("no_primary_key", [BUCKET, "updated_at"], [0, 2], [0, 0], primary_key=[]),
+            False, {"columns": ["id"], "modulus": 3},
+        ),
+        (
+            _yb_index_row("hashed_bucket", [BUCKET, "updated_at", "id"], [0, 2, 1], [4, 0, 0]),
+            False, {"columns": ["id"], "modulus": 3},
+        ),
+        (
+            _yb_index_row("hashed_timestamp", [BUCKET, "updated_at", "id"], [0, 2, 1], [0, 4, 0]),
+            False, {"columns": ["id"], "modulus": 3},
+        ),
+        (
+            _yb_index_row("expression_after_bucket", [BUCKET, "lower(note)"], [0, 0], [0, 0]),
+            False, {"columns": ["id"], "modulus": 3},
+        ),
+        (
+            _yb_index_row("bucket_only", [BUCKET], [0], [0]),
+            False, {"columns": ["id"], "modulus": 3},
+        ),
+        (
+            _yb_index_row("partial_keyset", [BUCKET, "updated_at"], [0, 2], [0, 0], is_partial=True),
+            False, {"columns": ["id"], "modulus": 3},
+        ),
+    ],
+    ids=lambda value: value.get("index_name") if isinstance(value, dict) else None,
+)
+def test_yugabyte_bucket_index_usability(row, usable, bucket):
+    adapter, _cursor = _yugabyte_adapter([row])
+
+    index = adapter.indexes("public", "payments")[0]
+
+    assert index["is_usable"] is usable
+    assert index["bucket"] == bucket
+    # Preflight reads the leading column after the bucket, which `bucket` records.
+    assert index["columns"] == row["key_columns"][1:]
+
+
+@pytest.mark.parametrize("expression", ["(yb_hash_code(id) % 0)", "(yb_hash_code(id) % 3 + 1)", "(id % 3)"])
+def test_yugabyte_unrecognised_leading_expression_is_not_a_bucket(expression):
+    adapter, _cursor = _yugabyte_adapter(
+        [_yb_index_row("other", [expression, "updated_at"], [0, 2], [0, 0])]
+    )
+
+    index = adapter.indexes("public", "payments")[0]
+
+    assert index["is_usable"] is False
+    assert index["bucket"] is None
+    assert index["columns"] == [expression, "updated_at"]
+
+
+def test_yugabyte_bucket_predicate_is_bound_into_the_window_and_minimum_queries():
+    adapter, cursor = _yugabyte_adapter([
+        _yb_index_row(
+            "keyset", ['(yb_hash_code("Id", b) % 3)', "updated_at", "Id", "b"],
+            [0, 3, 1, 2], [0, 0, 0, 0], primary_key=["Id", "b"],
+        )
+    ])
+    predicate = '(yb_hash_code("Id", "b") %% 3) IN (0, 1, 2)'
+
+    sql = build_metric_query(adapter, "public", "payments", "Id", "updated_at", ("row_count",))
+    cursor.fetchone.return_value = (None,)
+    adapter.minimum_timestamp(
+        "public", "payments", _column("updated_at", "timestamp without time zone"),
+        datetime(2026, 7, 22, tzinfo=timezone.utc),
+    )
+
+    assert sql.endswith(f'WHERE "updated_at" >= %s AND "updated_at" < %s AND {predicate}')
+    assert cursor.execute.call_args.args[0].endswith(f'WHERE "updated_at" < %s AND {predicate}')
+    # The catalog is read once per table, however many queries are built.
+    assert cursor.fetchall.call_count == 1
+
+
+@pytest.mark.parametrize(
+    "rows",
+    [
+        [],
+        [_yb_index_row("asc", ["updated_at"], [2], [0])],
+        # A plain timestamp index already serves the scan; leave the query unchanged.
+        [
+            _yb_index_row("asc", ["updated_at"], [2], [0]),
+            _yb_index_row("keyset", [BUCKET, "updated_at", "id"], [0, 2, 1], [0, 0, 0]),
+        ],
+        [_yb_index_row("keyset_on_pk", [BUCKET, "id"], [0, 1], [0, 0])],
+        [_yb_index_row("hashed_bucket", [BUCKET, "updated_at", "id"], [0, 2, 1], [4, 0, 0])],
+    ],
+)
+def test_yugabyte_window_predicate_is_added_only_for_a_leading_bucket_index(rows):
+    adapter, _cursor = _yugabyte_adapter(rows)
+
+    assert adapter.window_predicates("public", "payments", "updated_at") == []
+
+
+def test_yugabyte_bucket_index_passes_preflight_without_counting_rows():
+    adapter, cursor = _yugabyte_adapter(
+        [_yb_index_row("keyset", [BUCKET, "updated_at", "id"], [0, 2, 1], [0, 0, 0])]
+    )
+
+    preflight = preflight_source(adapter, "public", "payments", "updated_at", "SELECT 1", ())
+
+    assert preflight["status"] == "PASS"
+    assert preflight["has_leading_index"] is True
+    assert preflight["table_rows"] is None
+    assert cursor.fetchone.call_count == 0
+
+
+def test_yugabyte_catalog_failure_reaches_preflight_once():
+    # The failed read aborts the transaction, so a re-read would report that instead.
+    adapter, cursor = _yugabyte_adapter([])
+    cursor.execute.side_effect = psycopg2.OperationalError("catalog unavailable")
+
+    sql = build_metric_query(adapter, "public", "payments", "id", "updated_at", ("row_count",))
+    preflight = preflight_source(adapter, "public", "payments", "updated_at", sql, ())
+
+    assert preflight["status"] == "ERROR"
+    assert preflight["error"] == "catalog unavailable"
+    assert cursor.execute.call_count == 1

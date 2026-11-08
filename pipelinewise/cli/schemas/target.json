@@ -1,0 +1,206 @@
+{
+  "definitions": {
+    "db_conn_target_snowflake": {
+      "type": "object",
+      "properties": {
+        "account": {
+          "type": "string"
+        },
+        "dbname": {
+          "type": "string"
+        },
+        "user": {
+          "type": "string"
+        },
+        "private_key": {
+          "type": "string"
+        },
+        "warehouse": {
+          "type": "string"
+        },
+        "s3_bucket": {
+          "type": "string"
+        },
+        "s3_key_prefix": {
+          "type": "string"
+        },
+        "s3_acl": {
+          "type": "string"
+        },
+        "stage": {
+          "type": "string"
+        },
+        "file_format:": {
+          "type": "string"
+        },
+        "aws_access_key_id": {
+          "type": "string"
+        },
+        "aws_secret_access_key": {
+          "type": "string"
+        },
+        "aws_session_token": {
+          "type": "string"
+        },
+        "aws_profile": {
+          "type": "string"
+        },
+        "client_side_encryption_master_key": {
+          "type": "string"
+        },
+        "iceberg_query_history_poll_timeout_seconds": {
+          "type": "integer",
+          "minimum": 1
+        }
+      },
+      "required": [
+        "account",
+        "dbname",
+        "user",
+        "private_key",
+        "warehouse",
+        "s3_bucket",
+        "s3_key_prefix",
+        "stage",
+        "file_format"
+      ]
+    },
+    "db_conn_target_postgres": {
+      "type": "object",
+      "properties": {
+        "host": {
+          "type": "string"
+        },
+        "port": {
+          "type": "integer"
+        },
+        "user": {
+          "type": "string"
+        },
+        "password": {
+          "type": "string"
+        },
+        "dbname": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "host",
+        "port",
+        "user",
+        "password",
+        "dbname"
+      ]
+    },
+    "db_conn_target_s3_csv": {
+      "type": "object",
+      "properties": {
+        "aws_access_key_id": {
+          "type": "string"
+        },
+        "aws_secret_access_key": {
+          "type": "string"
+        },
+        "aws_session_token": {
+          "type": "string"
+        },
+        "aws_profile": {
+          "type": "string"
+        },
+        "s3_bucket": {
+          "type": "string"
+        },
+        "s3_key_prefix": {
+          "type": "string"
+        },
+        "s3_acl": {
+          "type": "string"
+        },
+        "delimiter": {
+          "type": "string"
+        },
+        "quotechar:": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "s3_bucket"
+      ]
+    }
+  },
+  "type": "object",
+  "not": {
+    "anyOf": [
+      {
+        "required": ["iceberg_create"]
+      },
+      {
+        "required": ["iceberg_version"]
+      },
+      {
+        "required": ["target_table_format"]
+      }
+    ]
+  },
+  "properties": {
+    "id": {
+      "type": "string",
+      "not": {
+        "enum": [
+          "tmp",
+          "profiling"
+        ]
+      }
+    },
+    "name": {
+      "type": "string"
+    },
+    "type": {
+      "type": "string",
+      "enum": [
+        "target-snowflake",
+        "target-postgres",
+        "target-s3-csv"
+      ]
+    },
+    "db_conn": {
+      "type": "object",
+      "properties": {
+        "role": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "not": {
+        "anyOf": [
+          {
+            "required": ["iceberg_create"]
+          },
+          {
+            "required": ["iceberg_version"]
+          },
+          {
+            "required": ["target_table_format"]
+          }
+        ]
+      },
+      "anyOf": [
+        {
+          "$ref": "#/definitions/db_conn_target_snowflake"
+        },
+        {
+          "$ref": "#/definitions/db_conn_target_postgres"
+        },
+        {
+          "$ref": "#/definitions/db_conn_target_s3_csv"
+        }
+      ]
+    }
+  },
+  "required": [
+    "id",
+    "name",
+    "type",
+    "db_conn"
+  ]
+}

@@ -1,0 +1,17 @@
+{
+  "host": "<Db host>",
+  "port": "<port>",
+  "user": "<username>",
+  "password": "<passwd>",
+  "filter_db": "db1,db2",
+  "engine": "<mysql|mariadb>",
+  "use_gtid": <boolean>,
+  "cursorclass": "<pymysql cursor Class>"
+  "server_id": "",
+  "database": "",
+  "ssl": "",
+  "ssl_ca": "",
+  "ssl_cert": "",
+  "ssl_key": "",
+  "internal_hostname": ""
+}

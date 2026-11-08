@@ -1,0 +1,77 @@
+runChecks: true
+
+actions:
+  repo-settings:
+    deleteBranchOnMerge: true
+  branch-protection-settings:
+    branches:
+      - name: master
+        dismissStaleReviews: true
+        numRequiredReviews: 1
+        requireLinearHistory: true
+        requireConversationResolution: true
+        requireBranchUpToDate: true
+        restrictMerge:
+          teams:
+            - name: analytics-platform
+            - name: machine-users
+        checks:
+          - name: lint_and_test
+            type: tests
+          - name: test_install_connectors
+            type: tests
+          - name: connector_tests
+            type: tests
+          - name: publish
+            type: tests
+          - name: e2e_tests_01
+            type: tests
+          - name: e2e_tests_02
+            type: tests
+          - name: e2e_tests_03
+            type: tests
+          - name: e2e_tests_04
+            type: tests
+          - name: e2e_tests_05
+            type: tests
+          - name: e2e_tests_06
+            type: tests
+          - name: e2e_tests_07
+            type: tests
+          - name: e2e_tests_08
+            type: tests
+          - name: e2e_tests_09
+            type: tests
+          - name: e2e_tests_10
+            type: tests
+          - name: e2e_tests_11
+            type: tests
+          - name: e2e_tests_12
+            type: tests
+          - name: e2e_tests_13
+            type: tests
+          - name: e2e_tests_14
+            type: tests
+          - name: e2e_tests_15
+            type: tests
+          - name: e2e_tests_16
+            type: tests
+          - name: e2e_tests_17
+            type: tests
+          - name: e2e_tests_18
+            type: tests
+          - name: e2e_tests_19
+            type: tests
+          - name: e2e_tests_20
+            type: tests
+          - name: e2e_tests_21
+            type: tests
+          - name: e2e_tests_22
+            type: tests
+          - name: e2e_tests_23
+            type: tests
+
+  sync-codeowners:
+    extraWriters:
+      - full-time-technical-staff
+      - machine-users

@@ -1,0 +1,434 @@
+.. _yaml_configuration:
+
+YAML configuration
+==================
+
+PipelineWise projects define global settings, targets, and taps in YAML.
+``import_config`` validates these files, performs discovery, and generates the
+connector JSON and state layout. Generated files below ``~/.pipelinewise`` are
+runtime artifacts, not configuration source.
+
+
+Project files
+-------------
+
+.. list-table::
+   :header-rows: 1
+   :widths: 28 24 48
+   :width: 100%
+
+   * - File
+     - Quantity
+     - Purpose
+   * - ``config.yml``
+     - One
+     - Global alerts, resync limit, switchover file, and backend database.
+   * - ``target_*.yml``
+     - One per destination
+     - Target identity and connection.
+   * - ``tap_*.yml``
+     - One per source pipeline
+     - Source, target reference, tables, replication, and optional transforms.
+
+Run ``pipelinewise init --name <project>`` to generate templates. Templates can
+include legacy connectors; check :ref:`connector_support` before using one.
+
+
+Global configuration
+--------------------
+
+.. code-block:: yaml
+
+   alert_handlers:
+     slack:
+       token: "{{ env_var['SLACK_BOT_TOKEN'] }}"
+       channel: "#pipeline-alerts"
+       data_diff_channel: "#data-diff-alerts"  # Optional
+
+   allowed_resync_max_size:
+     table_mb: 50000
+
+   switch_over_data_file: "switch_over_data.json"
+
+   backend_db:
+     host: "backend.example.com"
+     port: 5432
+     user: "pipelinewise"
+     password: "{{ env_var['BACKEND_PASSWORD'] }}"
+     dbname: "pipelinewise"
+     sslmode: "verify-full"
+     connect_timeout: 10
+     ddl_user: "pipelinewise_ddl"
+     ddl_password: "{{ env_var['BACKEND_DDL_PASSWORD'] }}"
+
+.. list-table:: Global settings
+   :header-rows: 1
+   :widths: 31 17 17 35
+   :width: 100%
+
+   * - Setting
+     - Required
+     - Default
+     - Effect
+   * - ``alert_handlers``
+     - No
+     - None
+     - Configures Slack or VictorOps failure delivery. See :ref:`alerts`.
+   * - ``alert_handlers.slack.data_diff_channel``
+     - No
+     - Slack ``channel``
+     - Sets a separate global Slack destination for data-diff alerts.
+       Tap-specific copies remain enabled. See :ref:`slack_alert_handler`.
+   * - ``allowed_resync_max_size`` / ``table_mb``
+     - No
+     - No limit
+     - Blocks oversized MariaDB/MySQL, PostgreSQL, or YugabyteDB-to-Snowflake
+       FullSync unless ``--force`` is used. YugabyteDB measures size
+       differently; see :ref:`yugabyte_resync_size_limit`.
+   * - ``switch_over_data_file``
+     - No
+     - None
+     - Supplies state mapping used by ``reset_state``.
+   * - ``backend_db``
+     - For data-diff
+     - Disabled
+     - Enables persisted data-diff definitions, runs, and coverage.
+   * - ``backend_db.connect_timeout``
+     - No
+     - ``10`` seconds
+     - Limits application-role connection attempts. The migration connection
+       does not currently inherit this timeout.
+
+Use a separate database and credentials for the backend and replication targets.
+See :ref:`data_diff_backend` for setup and isolation options.
+
+
+Tap configuration
+-----------------
+
+.. code-block:: yaml
+
+   id: "orders"
+   name: "Orders PostgreSQL"
+   type: "tap-postgres"
+   owner: "data-platform@example.com"
+   db_conn:
+     host: "postgres.example.com"
+     port: 5432
+     user: "pipelinewise"
+     password: "{{ env_var['POSTGRES_PASSWORD'] }}"
+     dbname: "orders"
+   target: "snowflake"
+   version_legacy_float_columns: false
+   batch_size_rows: 20000
+   stream_buffer_size: 0
+   schemas:
+     - source_schema: "public"
+       target_schema: "repl_orders"
+       target_schema_select_permissions:
+         - "analytics_reader"
+       tables:
+         - table_name: "orders"
+           replication_method: "INCREMENTAL"
+           replication_key: "updated_at"
+
+.. list-table:: Common tap settings
+   :header-rows: 1
+   :widths: 28 18 18 36
+   :width: 100%
+
+   * - Setting
+     - Required
+     - Default
+     - Effect
+   * - ``id`` / ``name`` / ``type``
+     - Yes
+     - —
+     - Identify the pipeline and source connector.
+   * - ``owner``
+     - Operationally required
+     - None
+     - Identifies the source-data owner.
+   * - ``db_conn``
+     - Yes
+     - —
+     - Connector-specific source connection. See :ref:`taps_list`.
+   * - ``target``
+     - Yes
+     - —
+     - Must match a target YAML ``id``.
+   * - ``batch_size_rows``
+     - No
+     - ``20000``
+     - Target batch size; schema accepts 1,000–5,000,000.
+   * - ``stream_buffer_size``
+     - No
+     - ``0``
+     - ``mbuffer`` memory in MB; ``0`` disables it, values 1–9 are rounded up
+       to 10 MB, and the maximum is 2500 MB. See :ref:`stream_buffering`.
+   * - ``batch_wait_limit_seconds``
+     - No
+     - None
+     - Flushes a partial Snowflake batch after the limit.
+   * - ``send_alert``
+     - No
+     - ``true``
+     - Suppresses tap and data-diff alerts when ``false``.
+   * - ``data_diff_defaults.initial_full_scan``
+     - No
+     - ``false``
+     - Set ``true`` to check shared history on the first data run. Tables can override this.
+       See :ref:`data_diff_initial_scan`.
+   * - ``slack_alert_channel``
+     - No
+     - Global channel
+     - Adds a tap-specific Slack destination; must start with ``#``.
+   * - ``native_to_iceberg_conversion``
+     - No
+     - Omitted
+     - Object with a Boolean ``enabled`` and an optional
+       ``conversion_warehouse``. With ``enabled: true``, ``run_tap`` converts
+       the tap's existing native Snowflake tables to managed Iceberg v3 before
+       it replicates. ``enabled: true`` is valid only with
+       ``target_table_format: iceberg``, ``iceberg_version: 3``, a
+       ``target-snowflake`` target, and an effective
+       ``data_flattening_max_level`` of ``0``. Any tap accepts
+       ``enabled: false``, for example to run the report on
+       ``conversion_warehouse`` before the switch. ``conversion_warehouse`` runs
+       only the conversion work and the tap's report on another Snowflake
+       warehouse. With ``enabled: false``, ``run_tap`` neither converts nor
+       resumes a pending conversion. Only PipelineWise reads the setting, from
+       its main configuration; it never reaches the target connector or
+       ``inheritable_config.json``. Configure it at the tap root, not in
+       ``db_conn`` or the target. See :ref:`snowflake_iceberg_auto_conversion`.
+   * - ``add_metadata_columns``
+     - No
+     - ``false``
+     - Adds ingestion metadata to :ref:`target-s3-csv` output. PostgreSQL and
+       Snowflake targets always include metadata automatically. See
+       :ref:`metadata_columns`.
+
+.. list-table:: Target-loading settings inherited from the tap
+   :header-rows: 1
+   :widths: 31 18 51
+   :width: 100%
+
+   * - Setting
+     - Default
+     - Effect
+   * - ``parallelism``
+     - ``0``
+     - Controls Singer target flush threads. ``0`` selects one thread per
+       buffered stream up to the target's effective cap.
+   * - ``parallelism_max``
+     - Generated as ``4``
+     - Currently ineffective: PipelineWise emits this name, but the PostgreSQL
+       and Snowflake targets read ``max_parallelism`` instead.
+   * - ``flush_all_streams``
+     - ``true``
+     - Flushes every buffered stream when one stream reaches its batch boundary.
+       Set ``false`` to flush only that stream. Flushing all streams can create
+       smaller, more frequent loads and increase loading cost.
+   * - ``primary_key_required``
+     - ``true``
+     - Rejects streams without a target merge key when enabled.
+   * - ``default_target_schema``
+     - None
+     - Supplies a target schema for taps without database-style mappings.
+   * - ``default_target_schema_select_permissions``
+     - None
+     - Applies default target read roles when supported.
+   * - ``data_flattening_max_level``
+     - Tap-specific or ``0``
+     - Expands nested objects into columns. ``0`` keeps flattening disabled;
+       higher values can create wide and changing target schemas. Managed
+       Iceberg FastSync requires ``0``; Singer-only Iceberg routes retain the
+       tap's normal setting.
+   * - ``target_table_format``
+     - Omitted
+     - Selects ``native`` or managed ``iceberg`` Snowflake tables for the
+       Singer target and supported FastSync routes. An omitted value or
+       ``native`` creates native tables; managed Iceberg creation requires
+       explicit ``iceberg``. The setting applies to every table in the tap.
+   * - ``iceberg_version``
+     - None
+     - Managed-Iceberg version discriminator. Its only supported value is integer
+       ``3``; it is required with ``target_table_format: iceberg`` and invalid
+       otherwise.
+   * - ``version_legacy_float_columns``
+     - ``false``
+     - For MariaDB/MySQL or PostgreSQL taps writing to Snowflake, set ``true``
+       to retain an eligible non-key legacy floating-point decimal column under a
+       timestamped name and create its fixed-point replacement. New decimal
+       columns use the current precision-preserving mapping regardless of this
+       setting. Existing floating-point decimal keys remain unchanged even when
+       this option is enabled. Configure it at the tap root, not in ``db_conn``
+       or the shared target.
+   * - ``validate_records``
+     - ``false``
+     - Validates Singer records against their emitted schema before loading.
+   * - ``split_large_files``
+     - ``false``
+     - Splits FastSync export archives for Snowflake staging.
+   * - ``split_file_chunk_size_mb``
+     - ``1000``
+     - Sets the split archive chunk size.
+   * - ``split_file_max_chunks``
+     - ``20``
+     - Limits the number of generated chunks.
+   * - ``archive_load_files``
+     - ``false``
+     - Retains Snowflake target load files in a separate S3 archive.
+   * - ``archive_load_files_s3_bucket`` / ``archive_load_files_s3_prefix``
+     - None
+     - Selects the archive destination when load-file archiving is enabled.
+
+``flush_all_streams`` controls Singer loading into PostgreSQL and Snowflake;
+it does not affect FastSync or PartialSync. Run ``import_config`` after upgrading
+to apply the new default to existing generated configs. Explicit YAML
+``flush_all_streams: false`` remains an opt-out. Standalone target connectors
+retain their ``false`` default.
+
+Flushing all buffered streams loads sparse streams sooner and allows fresher
+cross-stream checkpoints, but smaller, more frequent loads can increase loading
+cost. With ``false``, only the flushed stream's bookmark advances; both modes
+wait for the corresponding loads to finish before acknowledging their state.
+
+.. important::
+
+   Any tap whose Singer output is compatible with ``target-snowflake`` can
+   select managed Iceberg v3. FastSync FullSync and PartialSync for managed v3
+   remain limited to ``tap-mysql`` (MariaDB/MySQL) and ``tap-postgres``. Those two
+   FastSync-capable taps require ``data_flattening_max_level: 0``. Singer-only
+   sources retain their normal flattening setting, including Salesforce's
+   default level ``10``.
+   Native remains the default. PipelineWise converts an existing native table
+   only when the tap enables ``native_to_iceberg_conversion``; otherwise a
+   conflicting format fails before mutation. Every managed Iceberg version
+   other than v3 is rejected before mutation. See :ref:`snowflake_iceberg`.
+
+   Managed Iceberg selection is tap-level. Target YAML rejects these keys and
+   the removed ``iceberg_create`` setting. Remove ``iceberg_create`` and
+   configure each managed Iceberg tap before upgrading.
+
+.. warning::
+
+   The effective automatic Singer flush cap is currently 16, not 4. To change
+   it, set ``max_parallelism`` inside the target's ``db_conn``. Do not rely on
+   tap-level ``parallelism_max`` until the naming mismatch is fixed.
+
+
+Schemas and tables
+------------------
+
+``schemas`` maps source schemas into target schemas. Every table needs a
+``table_name``. Database tables also select a replication method:
+
+.. list-table:: Table settings
+   :header-rows: 1
+   :widths: 28 20 52
+   :width: 100%
+
+   * - Setting
+     - Required
+     - Behaviour
+   * - ``replication_method``
+     - Database tables
+     - ``LOG_BASED``, ``INCREMENTAL``, or ``FULL_TABLE``. See
+       :ref:`replication_methods`.
+   * - ``replication_key``
+     - For ``INCREMENTAL``
+     - Increasing source column used as the bookmark.
+   * - ``sync_start_from``
+     - No
+     - Routes explicit FastSync through PartialSync. See
+       :ref:`defined_partial_sync`.
+   * - ``transformations``
+     - No
+     - Applies load-time field protection. See :ref:`transformations`.
+   * - ``data_diff``
+     - No
+     - Compares source and target data on its own schedule. See :ref:`data_diff`.
+   * - ``data_diff.initial_full_scan``
+     - No
+     - Overrides the tap default. Set ``true`` to scan shared history first.
+
+Connector-specific schema or table mappings, such as ``s3_csv_mapping``, are
+documented on their connector page.
+
+
+Target configuration
+--------------------
+
+.. code-block:: yaml
+
+   id: "snowflake"
+   name: "Analytics Snowflake"
+   type: "target-snowflake"
+   db_conn:
+     account: "<ACCOUNT>"
+     dbname: "<DATABASE>"
+     user: "<USER>"
+     private_key: "/run/secrets/snowflake-key.pem"
+     warehouse: "<WAREHOUSE>"
+     s3_bucket: "<BUCKET>"
+     s3_key_prefix: "pipelinewise/"
+     stage: "<SCHEMA>.<STAGE>"
+     file_format: "<SCHEMA>.<FILE_FORMAT>"
+
+``id``, ``name``, ``type``, and ``db_conn`` are required. Connection fields are
+target-specific; see :ref:`targets_list`. A Snowflake target can set the optional
+positive integer ``iceberg_query_history_poll_timeout_seconds`` in ``db_conn``.
+It defaults to ``900`` seconds and bounds query-history recovery after an
+ambiguous FastSync Iceberg publication response.
+
+
+Secrets and validation
+----------------------
+
+Inject environment values with Jinja:
+
+.. code-block:: yaml
+
+   password: "{{ env_var['POSTGRES_PASSWORD'] }}"
+
+Ansible Vault values are also supported; see :ref:`encrypting_passwords`.
+
+Generated connector configuration can use environment lookups too. Commands
+that load a tap or target, such as ``run_tap``, ``discover_tap``, ``fast_sync``,
+``partial_sync_table``, ``test_tap_connection``, and ``tap_info``, render
+``{{ env_var['NAME'] }}`` lookups in the main, target, and tap ``config.json``.
+Use them when another tool generates these files and secrets must stay out of
+them:
+
+.. code-block:: text
+
+   "password": {{ env_var['POSTGRES_PASSWORD'] | tojson }}
+
+``tojson`` quotes and escapes the value, so any secret renders to valid JSON. A
+missing variable fails the command. Connectors read a rendered copy in the
+``tmp`` directory of the configuration directory. Only its owner can read it,
+and it is removed when the command exits. Files without lookups are used as
+they are, so ``import_config`` output is unaffected. Data-diff commands do not
+render lookups.
+
+After every change:
+
+.. code-block:: bash
+
+   pipelinewise validate --dir <project>
+   pipelinewise import_config --dir <project>
+
+``validate`` checks YAML and references but not connectivity. ``import_config``
+discovers the source and replaces generated runtime configuration only after the
+project passes validation.
+
+.. warning::
+
+   ``import_config`` treats a missing tap or target YAML file as a deletion. It
+   removes that connector's generated directory, including every ``state.json``
+   bookmark; removing a target removes all of its taps. Removing a PostgreSQL
+   tap also drops its replication slot. Renaming an ``id`` has the same effect
+   as deleting the old connector and adding a new one. Stop the pipeline, back
+   up its generated state, and plan a full initial sync before removing or
+   renaming imported configuration.
